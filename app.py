@@ -109,7 +109,7 @@ def login_page():
                     st.rerun()
                 else:
                     st.error("❌ Wrong credentials")
-        st.caption("For LOGIN:  Contact Admin")
+        st.caption("Demo:  admin / admin@2026")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
@@ -267,6 +267,16 @@ FILES = {
 TEAM_FILE  = "sales_backend_teams.json"  # admin-managed Sales Backend Team ↔ State/District mapping
 ALIAS_FILE = "custom_alias_map.json"     # admin-managed State/District name-mapping overrides
 
+SALES_SOURCE_FILE = "sales_invoice_data.xlsx"
+# Optional admin-uploaded raw invoice/order export. Expected columns (case-insensitive,
+# order doesn't matter): INVOICE NO, DESPATCH DATE, ORDER NO, ORDER DATE, BILLING NAME,
+# CLIENT NAME, STATE, DISTRICT/ST, QTY, PRODUCT.
+# When present, ALL sales figures (Total Sale, current-month Sale, 6-Month Avg, GG/IG
+# totals) across every tab are computed live from this file instead of the pre-built
+# sale columns in the census workbook — population, KRM/KRO/JR.KRO ownership etc. still
+# come from the census file and are auto-matched in by district. Remove the file (via
+# the admin tab) to revert to the census workbook's built-in sale columns.
+
 MONTH_NAMES = ["January","February","March","April","May","June","July",
                "August","September","October","November","December"]
 
@@ -333,7 +343,10 @@ def file_mtime(path):
 
 def get_last_update_str():
     """Human-readable date/time of the most recently updated data file."""
-    mtimes = [file_mtime(FILES[k]) for k in ("census", "active", "custom") if file_mtime(FILES[k]) > 0]
+    keys = ["census", "active", "custom"]
+    mtimes = [file_mtime(FILES[k]) for k in keys if file_mtime(FILES[k]) > 0]
+    if file_mtime(SALES_SOURCE_FILE) > 0:
+        mtimes.append(file_mtime(SALES_SOURCE_FILE))
     if not mtimes:
         return "No data uploaded yet"
     return datetime.fromtimestamp(max(mtimes)).strftime("%d %b %Y · %I:%M %p")
@@ -387,38 +400,160 @@ def effective_alias_maps():
     return state_alias, dist_alias
 
 # ─────────────────────────────────────────────────────────────────────────────
+# RAW SALES / INVOICE DATA  (optional admin-uploaded data source)
+# ─────────────────────────────────────────────────────────────────────────────
+def classify_product(product):
+    """GG / IG bucketing for the product-wise cards. Anything that doesn't
+    contain 'GG' or 'IG' in its product text falls into OTHER (still counted
+    in Total Sale, just not split into the GG/IG cards)."""
+    p = str(product).upper()
+    if "GG" in p: return "GG"
+    if "IG" in p: return "IG"
+    return "OTHER"
+
+def compute_invoice_sales(path, state_alias, dist_alias):
+    """Read a raw invoice/order-level sales export and aggregate it to
+    district level (Total Sale, current-month Sale, 6-Month Avg, GG/IG).
+
+    Expected columns (case-insensitive, any order): INVOICE NO, DESPATCH
+    DATE, ORDER NO, ORDER DATE, BILLING NAME, CLIENT NAME, STATE,
+    DISTRICT/ST, QTY, PRODUCT. Only STATE, DISTRICT/ST, QTY and a date
+    column (DESPATCH DATE, falling back to ORDER DATE) are required.
+
+    Returns (agg_df, month_name, unmatched_df, row_count) or
+    (None, None, None, 0) if no file / no usable rows.
+    """
+    if not path or not os.path.exists(path):
+        return None, None, None, 0
+
+    try:
+        inv = pd.read_csv(path) if str(path).lower().endswith(".csv") else pd.read_excel(path)
+    except Exception as e:
+        st.error(f"⚠️ Couldn't read the sales data file: {e}")
+        return None, None, None, 0
+
+    inv.columns = [str(c).strip().upper() for c in inv.columns]
+
+    def pick(*names):
+        for n in names:
+            if n in inv.columns:
+                return n
+        return None
+
+    col_state    = pick("STATE")
+    col_district = pick("DISTRICT/ST", "DISTRICT / ST", "DISTRICT", "DIST", "DISTRICT NAME")
+    col_qty      = pick("QTY", "QUANTITY")
+    col_date     = pick("DESPATCH DATE", "DISPATCH DATE", "ORDER DATE")
+    col_product  = pick("PRODUCT", "PRODUCT NAME", "ITEM")
+
+    missing = [label for label, col in [
+        ("STATE", col_state), ("DISTRICT/ST", col_district),
+        ("QTY", col_qty), ("DESPATCH DATE (or ORDER DATE)", col_date),
+    ] if col is None]
+    if missing:
+        st.error(
+            "⚠️ Sales data file is missing required column(s): "
+            f"**{', '.join(missing)}**.\n\nColumns found: {', '.join(inv.columns)}"
+        )
+        return None, None, None, 0
+
+    inv = inv.rename(columns={col_state: "STATE", col_district: "DISTRICT_RAW",
+                               col_qty: "QTY", col_date: "DATE"})
+    inv["PRODUCT"] = inv[col_product] if col_product else ""
+
+    inv["STATE"]        = inv["STATE"].astype(str).str.strip().str.upper()
+    inv["DISTRICT_RAW"] = inv["DISTRICT_RAW"].astype(str).str.strip().str.upper()
+    inv["QTY"]          = pd.to_numeric(inv["QTY"], errors="coerce").fillna(0)
+    inv["DATE"]         = pd.to_datetime(inv["DATE"], errors="coerce")
+    inv = inv.dropna(subset=["DATE"])
+    row_count = len(inv)
+    if inv.empty:
+        return None, None, None, 0
+
+    inv["state_norm"] = inv["STATE"].map(lambda s: state_alias.get(s, s))
+    inv["dist_norm"]  = inv["DISTRICT_RAW"].map(lambda d: dist_alias.get(d, d))
+    inv = inv[inv["dist_norm"] != "_SKIP_"]
+
+    inv["month_period"] = inv["DATE"].dt.to_period("M")
+    latest_period  = inv["month_period"].max()
+    month_name     = latest_period.strftime("%B")
+    months_present = sorted(inv["month_period"].unique())
+    last6          = months_present[-6:]
+
+    inv["bucket"] = inv["PRODUCT"].map(classify_product)
+
+    g = ["state_norm", "dist_norm"]
+    total = inv.groupby(g)["QTY"].sum().rename("total_sale")
+    month = inv[inv["month_period"] == latest_period].groupby(g)["QTY"].sum().rename("month_sale")
+    avg6  = inv[inv["month_period"].isin(last6)].groupby(g)["QTY"].sum().rename("avg_6m")
+    gg_t  = inv[inv["bucket"] == "GG"].groupby(g)["QTY"].sum().rename("gg_total")
+    ig_t  = inv[inv["bucket"] == "IG"].groupby(g)["QTY"].sum().rename("ig_total")
+    gg_a  = inv[(inv["bucket"] == "GG") & inv["month_period"].isin(last6)].groupby(g)["QTY"].sum().rename("gg_avg")
+    ig_a  = inv[(inv["bucket"] == "IG") & inv["month_period"].isin(last6)].groupby(g)["QTY"].sum().rename("ig_avg")
+
+    agg = pd.concat([total, month, avg6, gg_t, ig_t, gg_a, ig_a], axis=1).fillna(0).reset_index()
+    agg = agg.rename(columns={"state_norm": "state", "dist_norm": "district"})
+
+    unmatched = (
+        inv[["STATE", "DISTRICT_RAW", "state_norm", "dist_norm"]]
+        .drop_duplicates()
+        .rename(columns={"STATE": "state_raw", "DISTRICT_RAW": "district_raw"})
+        .reset_index(drop=True)
+    )
+
+    return agg, month_name, unmatched, row_count
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # DATA LOADERS
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner="Loading data…")
 def load_all(_ts):
     """_ts is a tuple of file mtimes; changing it busts the cache."""
 
-    # ── Census workbook ───────────────────────────────────────
+    # ── Census workbook (district identity + population, always the source) ──
     raw = pd.read_excel(FILES["census"])
     raw.columns = [str(c).strip() for c in raw.columns]
 
-    # The "current month" sale column's header changes every time the sheet
-    # is refreshed (e.g. "June Sale" → "July Sale"). Detect it by pattern so
-    # the dashboard doesn't break every month — see find_month_sale_column().
-    month_col, month_name = find_month_sale_column(raw.columns)
-    if month_col is None:
-        st.error(
-            "⚠️ Couldn't find a monthly sale column (expected something like "
-            f"'June Sale' or 'July Sale') in **{FILES['census']}**.\n\n"
-            f"Columns found: {', '.join(raw.columns)}"
-        )
-        st.stop()
+    state_alias, dist_alias = effective_alias_maps()
 
-    core = raw[["District code","State name","District name","Population",
-                "KRM","KRO","JN. KRO","Responsible",
-                "Total Sale","last 6 month avg.", month_col,
-                "GG TOTAL SALE","GG AVERAGE OF 6 MONTH",
-                "IG TOTAL SALE","IG AVERAGE OF 6 MONTH"]].copy()
+    # ── Sales figures: prefer an admin-uploaded raw invoice file if present,
+    #    otherwise fall back to the pre-built sale columns in the census sheet.
+    invoice_agg, invoice_month, invoice_unmatched, invoice_rows = compute_invoice_sales(
+        SALES_SOURCE_FILE, state_alias, dist_alias
+    )
+    using_invoice_data = invoice_agg is not None
 
-    core.columns = ["dist_code","state","district","population",
-                    "krm","kro","jn_kro","responsible",
-                    "total_sale","avg_6m","month_sale",
-                    "gg_total","gg_avg","ig_total","ig_avg"]
+    if using_invoice_data:
+        month_name = invoice_month
+        core = raw[["District code","State name","District name","Population",
+                    "KRM","KRO","JN. KRO","Responsible"]].copy()
+        core.columns = ["dist_code","state","district","population",
+                        "krm","kro","jn_kro","responsible"]
+    else:
+        # The "current month" sale column's header changes every time the
+        # sheet is refreshed (e.g. "June Sale" → "July Sale"). Detect it by
+        # pattern so the dashboard doesn't break every month.
+        month_col, month_name = find_month_sale_column(raw.columns)
+        if month_col is None:
+            st.error(
+                "⚠️ Couldn't find a monthly sale column (expected something like "
+                f"'June Sale' or 'July Sale') in **{FILES['census']}**, and no "
+                "sales data file has been uploaded.\n\n"
+                f"Columns found: {', '.join(raw.columns)}"
+            )
+            st.stop()
+
+        core = raw[["District code","State name","District name","Population",
+                    "KRM","KRO","JN. KRO","Responsible",
+                    "Total Sale","last 6 month avg.", month_col,
+                    "GG TOTAL SALE","GG AVERAGE OF 6 MONTH",
+                    "IG TOTAL SALE","IG AVERAGE OF 6 MONTH"]].copy()
+
+        core.columns = ["dist_code","state","district","population",
+                        "krm","kro","jn_kro","responsible",
+                        "total_sale","avg_6m","month_sale",
+                        "gg_total","gg_avg","ig_total","ig_avg"]
 
     core["state"]    = core["state"].str.strip().str.upper()
     core["district"] = core["district"].str.strip().str.upper()
@@ -428,8 +563,17 @@ def load_all(_ts):
         core[col] = core[col].fillna("").str.strip().str.upper()
         core[col] = core[col].replace("", None)
 
-    for col in ["total_sale","avg_6m","month_sale","gg_total","gg_avg","ig_total","ig_avg"]:
-        core[col] = pd.to_numeric(core[col], errors="coerce")
+    sale_cols = ["total_sale","avg_6m","month_sale","gg_total","gg_avg","ig_total","ig_avg"]
+    if using_invoice_data:
+        # Population/KRM/etc. stay keyed on the census district; sales figures
+        # are looked up (auto-matched) from the invoice aggregation by the
+        # same (state, district) key — districts with no invoices get 0s.
+        core = core.merge(invoice_agg, on=["state","district"], how="left")
+        for col in sale_cols:
+            core[col] = pd.to_numeric(core[col], errors="coerce").fillna(0)
+    else:
+        for col in sale_cols:
+            core[col] = pd.to_numeric(core[col], errors="coerce")
 
     # ── Custom columns ────────────────────────────────────────
     try:
@@ -440,8 +584,6 @@ def load_all(_ts):
         pass
 
     # ── Active districts ──────────────────────────────────────
-    state_alias, dist_alias = effective_alias_maps()
-
     act = pd.read_excel(FILES["active"], header=None)
     act.columns = ["a","b","state_raw","district_raw"]
     act = act.dropna(subset=["state_raw","district_raw"])
@@ -456,15 +598,26 @@ def load_all(_ts):
         act.apply(lambda r: (r["state_norm"], r["dist_norm"]), axis=1)
     )
 
-    # ── Diagnostics: active rows whose mapped name still isn't a real
-    #    census (state, district) — these need a mapping fix from the admin.
+    # ── Diagnostics: rows (from either the active-district file or the
+    #    uploaded sales file) whose mapped name still isn't a real census
+    #    (state, district) — these need a mapping fix from the admin.
     valid_pairs = set(zip(core["state"], core["district"]))
     unmatched_mask = ~act.apply(lambda r: (r["state_norm"], r["dist_norm"]) in valid_pairs, axis=1)
     unmatched_active = (
         act[unmatched_mask][["state_raw","district_raw","state_norm","dist_norm"]]
-        .drop_duplicates()
-        .reset_index(drop=True)
+        .drop_duplicates().reset_index(drop=True)
     )
+    unmatched_active["source"] = "Active-District File"
+
+    if using_invoice_data and invoice_unmatched is not None and not invoice_unmatched.empty:
+        inv_mask = ~invoice_unmatched.apply(lambda r: (r["state_norm"], r["dist_norm"]) in valid_pairs, axis=1)
+        unmatched_sales = invoice_unmatched[inv_mask].drop_duplicates().reset_index(drop=True)
+        unmatched_sales["source"] = "Sales Data File"
+    else:
+        unmatched_sales = pd.DataFrame(columns=["state_raw","district_raw","state_norm","dist_norm","source"])
+
+    unmatched_locations = pd.concat([unmatched_active, unmatched_sales], ignore_index=True) \
+        .drop_duplicates(subset=["state_raw","district_raw"]).reset_index(drop=True)
 
     # ── Determine included states (all states with KRM OR active presence) ──
     krm_states = set(core[core["krm"].notna()]["state"].unique())
@@ -491,10 +644,15 @@ def load_all(_ts):
     # populate the admin mapping dropdowns, independent of `include` above.
     census_districts = core[["state","district"]].drop_duplicates().reset_index(drop=True)
 
-    return df, month_name, unmatched_active, census_districts
+    sales_source_info = {
+        "using_invoice_data": using_invoice_data,
+        "invoice_rows": invoice_rows,
+    }
+
+    return df, month_name, unmatched_locations, census_districts, sales_source_info
 
 def get_ts():
-    return tuple(file_mtime(f) for f in FILES.values()) + (file_mtime(ALIAS_FILE),)
+    return tuple(file_mtime(f) for f in FILES.values()) + (file_mtime(ALIAS_FILE), file_mtime(SALES_SOURCE_FILE))
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SMART SEARCH INDEX
@@ -548,7 +706,7 @@ def dashboard():
         st.session_state["last_ts"] = ts
         st.cache_data.clear()
 
-    df, month_name, unmatched_locations, census_districts = load_all(ts)
+    df, month_name, unmatched_locations, census_districts, sales_source_info = load_all(ts)
     srch_idx= build_search_index(df)
     teams   = load_teams()
     is_admin= st.session_state.get("user","").lower() == "admin"
@@ -760,11 +918,13 @@ def dashboard():
     if is_admin:
         tab_names.append("🛠️ Sales Backend Teams (Admin)")
         tab_names.append("🧭 Location Mapping (Admin)")
+        tab_names.append("📤 Sales Data (Admin)")
 
     _tabs = st.tabs(tab_names)
     tab_live, tab_map, tab_pres, tab_analysis, tab_sales, tab_team, tab_table = _tabs[:7]
-    tab_admin = _tabs[7] if is_admin else None
+    tab_admin   = _tabs[7] if is_admin else None
     tab_mapping = _tabs[8] if is_admin else None
+    tab_sales_up= _tabs[9] if is_admin else None
 
     # ═══════════════════════════════════════════════════════════
     # TAB 1 — LIVE DASHBOARD (Power-BI style)
@@ -1526,17 +1686,20 @@ def dashboard():
                 return {d.title(): d for d in opts}
 
             # ── Diagnostics: entries that don't resolve to a real district ──
-            st.markdown("#### ⚠️ Unmatched Active-District Entries")
+            st.markdown("#### ⚠️ Unmatched Location Entries")
             if unmatched_locations.empty:
-                st.success("✅ All entries in the active-district file matched a census district. Nothing to fix.")
+                st.success("✅ All entries in the active-district and sales data files matched a census district. Nothing to fix.")
             else:
                 st.warning(
-                    f"**{len(unmatched_locations)}** entries from `{FILES['active']}` don't match "
-                    "any census district — these are **not** being counted as active anywhere in "
-                    "the dashboard until mapped below."
+                    f"**{len(unmatched_locations)}** entries (from the active-district file "
+                    "and/or the uploaded sales data file) don't match any census district — "
+                    "these are **not** being counted anywhere in the dashboard until mapped below."
                 )
                 for i, row in unmatched_locations.iterrows():
-                    with st.expander(f"❓ {row['district_raw'].title()}  —  ({row['state_raw'].title()})"):
+                    with st.expander(
+                        f"❓ {row['district_raw'].title()}  —  ({row['state_raw'].title()})  "
+                        f"· from {row.get('source','Unknown source')}"
+                    ):
                         st.caption(
                             f"Currently resolves to **{row['state_norm'].title()} / "
                             f"{row['dist_norm'].title()}**, which isn't a census district."
@@ -1646,6 +1809,83 @@ def dashboard():
                         st.rerun()
 
     st.markdown("---")
+
+    # ═══════════════════════════════════════════════════════════
+    # TAB 9 — SALES DATA UPLOAD (ADMIN ONLY)
+    # ═══════════════════════════════════════════════════════════
+    if is_admin and tab_sales_up is not None:
+        with tab_sales_up:
+            st.markdown('<div class="sec">📤 Sales Data Source</div>', unsafe_allow_html=True)
+            st.caption(
+                "By default, sales figures (Total Sale, current-month Sale, 6-Month Avg, "
+                "GG/IG) come from the pre-built columns in the census workbook. Upload a raw "
+                "invoice / order-level export here instead, and every tab in this dashboard — "
+                "Live Dashboard, Analysis, Product Sales, Team View, Data Table — will compute "
+                "those same figures live from it. Population, KRM/KRO/JR.KRO ownership, and "
+                "district identity keep coming from the census file and are auto-matched in by "
+                "district, so you don't need to duplicate that data in your sales export."
+            )
+
+            if sales_source_info["using_invoice_data"]:
+                st.success(
+                    f"✅ **Using uploaded sales data** — {sales_source_info['invoice_rows']:,} "
+                    f"invoice rows loaded, current month detected as **{month_name}**."
+                )
+                if st.button("🗑️ Remove uploaded sales data & revert to census sale columns"):
+                    if os.path.exists(SALES_SOURCE_FILE):
+                        os.remove(SALES_SOURCE_FILE)
+                    st.cache_data.clear()
+                    st.success("Reverted to census workbook sale columns.")
+                    st.rerun()
+            else:
+                st.info(
+                    "ℹ️ **Using the census workbook's built-in sale columns** — no sales data "
+                    "file uploaded yet."
+                )
+
+            st.markdown("---")
+            st.markdown("#### ⬆️ Upload / Replace Sales Data")
+            st.caption(
+                "Accepted formats: `.xlsx` or `.csv`. Required columns (any order, case-"
+                "insensitive) — **STATE**, **DISTRICT/ST**, **QTY**, and **DESPATCH DATE** "
+                "(or ORDER DATE). Optional but recommended: **PRODUCT** (used to split GG vs "
+                "IG — matched by the text 'GG' / 'IG' appearing in the product name), "
+                "**INVOICE NO**, **ORDER NO**, **BILLING NAME**, **CLIENT NAME**."
+            )
+            up = st.file_uploader("Sales data file", type=["xlsx", "xls", "csv"], key="sales_data_uploader")
+            if up is not None:
+                dest = SALES_SOURCE_FILE if up.name.lower().endswith((".xlsx",".xls")) \
+                       else SALES_SOURCE_FILE.replace(".xlsx",".csv")
+                with open(dest, "wb") as f:
+                    f.write(up.getbuffer())
+                # Only one sales source file should exist at a time
+                other = SALES_SOURCE_FILE.replace(".xlsx",".csv") if dest == SALES_SOURCE_FILE else SALES_SOURCE_FILE
+                if os.path.exists(other):
+                    os.remove(other)
+                st.cache_data.clear()
+                st.success(f"Uploaded **{up.name}** — processing…")
+                st.rerun()
+
+            st.markdown("---")
+            st.markdown("#### 📐 How the figures are computed")
+            st.markdown(html_block("""
+            <ul style='font-size:13px;color:#333;line-height:1.7;'>
+              <li><b>District match:</b> each row's STATE / DISTRICT-ST is matched to a
+                  census district using the same name-mapping table as the
+                  🧭 Location Mapping tab. Rows that don't match show up there for you to fix.</li>
+              <li><b>Total Sale:</b> sum of QTY for a district, across all rows in the file.</li>
+              <li><b>Current-month Sale:</b> sum of QTY for the most recent calendar month
+                  found in DESPATCH DATE / ORDER DATE — this also sets the month label used
+                  across the dashboard (e.g. "July (MT)").</li>
+              <li><b>6-Month Avg:</b> sum of QTY over the most recent 6 calendar months
+                  present in the file (matches how the census workbook's own
+                  "last 6 month avg." column was structured).</li>
+              <li><b>GG / IG split:</b> a row counts toward GG if its PRODUCT text contains
+                  "GG", toward IG if it contains "IG"; everything else still counts toward
+                  Total Sale but isn't split into either card.</li>
+            </ul>
+            """), unsafe_allow_html=True)
+
     st.caption("🇮🇳 HMB Presence & Sales Dashboard · Built with Streamlit + Plotly")
 
 
