@@ -109,7 +109,7 @@ def login_page():
                     st.rerun()
                 else:
                     st.error("❌ Wrong credentials")
-        st.caption("Demo:  admin / admin@2026")
+        st.caption("For LOGIN:  Contact Admin")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
@@ -264,7 +264,8 @@ FILES = {
     "meta":    "custom_columns_meta.json",
 }
 
-TEAM_FILE = "sales_backend_teams.json"   # admin-managed Sales Backend Team ↔ State/District mapping
+TEAM_FILE  = "sales_backend_teams.json"  # admin-managed Sales Backend Team ↔ State/District mapping
+ALIAS_FILE = "custom_alias_map.json"     # admin-managed State/District name-mapping overrides
 
 MONTH_NAMES = ["January","February","March","April","May","June","July",
                "August","September","October","November","December"]
@@ -354,6 +355,38 @@ def save_teams(teams):
         json.dump(teams, f, indent=2)
 
 # ─────────────────────────────────────────────────────────────────────────────
+# STATE / DISTRICT NAME MAPPING  (admin-managed overrides)
+# ─────────────────────────────────────────────────────────────────────────────
+# The "active district" file and the census file often spell state/district
+# names differently (e.g. "WB" vs "WEST BENGAL", "MOTIHARI" vs "PURBA
+# CHAMPARAN"). STATE_ALIAS / DIST_ALIAS above cover the mappings known when
+# this app was built, but new mismatches will keep showing up as the source
+# files get updated. Rather than editing code every time, admins can add new
+# mappings from the "🗺️ Location Mapping" admin tab; those go here, in a
+# JSON file, and are merged on top of the built-in defaults at load time.
+def load_alias_overrides():
+    if os.path.exists(ALIAS_FILE):
+        try:
+            with open(ALIAS_FILE, "r") as f:
+                data = json.load(f)
+            return {"states": data.get("states", {}), "districts": data.get("districts", {})}
+        except Exception:
+            return {"states": {}, "districts": {}}
+    return {"states": {}, "districts": {}}
+
+def save_alias_overrides(overrides):
+    with open(ALIAS_FILE, "w") as f:
+        json.dump(overrides, f, indent=2)
+
+def effective_alias_maps():
+    """Built-in STATE_ALIAS/DIST_ALIAS merged with admin-added overrides
+    (overrides win on conflict)."""
+    overrides = load_alias_overrides()
+    state_alias = {**STATE_ALIAS, **{k.upper(): v.upper() for k, v in overrides["states"].items()}}
+    dist_alias  = {**DIST_ALIAS,  **{k.upper(): v.upper() for k, v in overrides["districts"].items()}}
+    return state_alias, dist_alias
+
+# ─────────────────────────────────────────────────────────────────────────────
 # DATA LOADERS
 # ─────────────────────────────────────────────────────────────────────────────
 @st.cache_data(show_spinner="Loading data…")
@@ -407,18 +440,30 @@ def load_all(_ts):
         pass
 
     # ── Active districts ──────────────────────────────────────
+    state_alias, dist_alias = effective_alias_maps()
+
     act = pd.read_excel(FILES["active"], header=None)
     act.columns = ["a","b","state_raw","district_raw"]
     act = act.dropna(subset=["state_raw","district_raw"])
     act = act[act["state_raw"].astype(str).str.strip() != "STATE"].copy()
     act["state_raw"]    = act["state_raw"].str.strip().str.upper()
     act["district_raw"] = act["district_raw"].str.strip().str.upper()
-    act["state_norm"]   = act["state_raw"].map(lambda s: STATE_ALIAS.get(s, s))
-    act["dist_norm"]    = act["district_raw"].map(lambda d: DIST_ALIAS.get(d, d))
+    act["state_norm"]   = act["state_raw"].map(lambda s: state_alias.get(s, s))
+    act["dist_norm"]    = act["district_raw"].map(lambda d: dist_alias.get(d, d))
     act = act[~act["dist_norm"].isin(["_SKIP_"])]
 
     active_set = set(
         act.apply(lambda r: (r["state_norm"], r["dist_norm"]), axis=1)
+    )
+
+    # ── Diagnostics: active rows whose mapped name still isn't a real
+    #    census (state, district) — these need a mapping fix from the admin.
+    valid_pairs = set(zip(core["state"], core["district"]))
+    unmatched_mask = ~act.apply(lambda r: (r["state_norm"], r["dist_norm"]) in valid_pairs, axis=1)
+    unmatched_active = (
+        act[unmatched_mask][["state_raw","district_raw","state_norm","dist_norm"]]
+        .drop_duplicates()
+        .reset_index(drop=True)
     )
 
     # ── Determine included states (all states with KRM OR active presence) ──
@@ -442,10 +487,14 @@ def load_all(_ts):
     df["lon"]            = df.apply(lambda r: get_coords(r["district"], r["state"])[1], axis=1)
     df["krm_display"]    = df["krm"].fillna("UNASSIGNED")
 
-    return df, month_name
+    # Full canonical (state, district) list from the census file — used to
+    # populate the admin mapping dropdowns, independent of `include` above.
+    census_districts = core[["state","district"]].drop_duplicates().reset_index(drop=True)
+
+    return df, month_name, unmatched_active, census_districts
 
 def get_ts():
-    return tuple(file_mtime(f) for f in FILES.values())
+    return tuple(file_mtime(f) for f in FILES.values()) + (file_mtime(ALIAS_FILE),)
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SMART SEARCH INDEX
@@ -499,7 +548,7 @@ def dashboard():
         st.session_state["last_ts"] = ts
         st.cache_data.clear()
 
-    df, month_name = load_all(ts)
+    df, month_name, unmatched_locations, census_districts = load_all(ts)
     srch_idx= build_search_index(df)
     teams   = load_teams()
     is_admin= st.session_state.get("user","").lower() == "admin"
@@ -710,10 +759,12 @@ def dashboard():
     ]
     if is_admin:
         tab_names.append("🛠️ Sales Backend Teams (Admin)")
+        tab_names.append("🧭 Location Mapping (Admin)")
 
     _tabs = st.tabs(tab_names)
     tab_live, tab_map, tab_pres, tab_analysis, tab_sales, tab_team, tab_table = _tabs[:7]
     tab_admin = _tabs[7] if is_admin else None
+    tab_mapping = _tabs[8] if is_admin else None
 
     # ═══════════════════════════════════════════════════════════
     # TAB 1 — LIVE DASHBOARD (Power-BI style)
@@ -1450,6 +1501,149 @@ def dashboard():
                             del teams[tname]
                             save_teams(teams)
                             st.rerun()
+
+    # ═══════════════════════════════════════════════════════════
+    # TAB 8 — LOCATION MAPPING (ADMIN ONLY)
+    # ═══════════════════════════════════════════════════════════
+    if is_admin and tab_mapping is not None:
+        with tab_mapping:
+            st.markdown('<div class="sec">🧭 State / District Name Mapping</div>', unsafe_allow_html=True)
+            st.caption(
+                "The **Active District** file and the **Census** file don't always spell state "
+                "or district names the same way (e.g. `WB` vs West Bengal, `MOTIHARI` vs Purba "
+                "Champaran). When a name doesn't match, that district silently drops out of the "
+                "'Active' count everywhere in the dashboard. Fix mismatches here — changes save "
+                "to `custom_alias_map.json` and apply immediately, no code edits needed."
+            )
+
+            state_label_map = {s: STATE_LABELS.get(s, s.title())
+                                for s in sorted(census_districts["state"].unique())}
+            label_to_state  = {v: k for k, v in state_label_map.items()}
+            sorted_state_labels = sorted(state_label_map.values())
+
+            def district_options(raw_state):
+                opts = sorted(census_districts[census_districts["state"] == raw_state]["district"].unique())
+                return {d.title(): d for d in opts}
+
+            # ── Diagnostics: entries that don't resolve to a real district ──
+            st.markdown("#### ⚠️ Unmatched Active-District Entries")
+            if unmatched_locations.empty:
+                st.success("✅ All entries in the active-district file matched a census district. Nothing to fix.")
+            else:
+                st.warning(
+                    f"**{len(unmatched_locations)}** entries from `{FILES['active']}` don't match "
+                    "any census district — these are **not** being counted as active anywhere in "
+                    "the dashboard until mapped below."
+                )
+                for i, row in unmatched_locations.iterrows():
+                    with st.expander(f"❓ {row['district_raw'].title()}  —  ({row['state_raw'].title()})"):
+                        st.caption(
+                            f"Currently resolves to **{row['state_norm'].title()} / "
+                            f"{row['dist_norm'].title()}**, which isn't a census district."
+                        )
+                        guess_state = row["state_norm"] if row["state_norm"] in state_label_map else (
+                            row["state_raw"] if row["state_raw"] in state_label_map
+                            else next(iter(state_label_map))
+                        )
+                        sel_state_label = st.selectbox(
+                            "Correct State", sorted_state_labels,
+                            index=sorted_state_labels.index(state_label_map[guess_state]),
+                            key=f"map_state_{i}",
+                        )
+                        sel_state_raw = label_to_state[sel_state_label]
+                        dopts = district_options(sel_state_raw)
+                        skip = st.checkbox(
+                            "🚫 Not a real district — skip this entry entirely",
+                            key=f"map_skip_{i}",
+                        )
+                        sel_dist_label = None
+                        if not skip:
+                            if dopts:
+                                sel_dist_label = st.selectbox(
+                                    "Correct District", sorted(dopts.keys()), key=f"map_dist_{i}"
+                                )
+                            else:
+                                st.info("No census districts found for that state.")
+
+                        if st.button("💾 Save Mapping", key=f"map_save_{i}"):
+                            ov = load_alias_overrides()
+                            if sel_state_raw != row["state_raw"]:
+                                ov["states"][row["state_raw"]] = sel_state_raw
+                            if skip:
+                                ov["districts"][row["district_raw"]] = "_SKIP_"
+                            elif sel_dist_label:
+                                ov["districts"][row["district_raw"]] = dopts[sel_dist_label]
+                            save_alias_overrides(ov)
+                            st.cache_data.clear()
+                            st.success("Saved — refreshing…")
+                            st.rerun()
+
+            # ── Existing custom mappings, with delete ──
+            st.markdown("---")
+            st.markdown("#### 📖 Custom Mappings on File")
+            overrides = load_alias_overrides()
+            mc1, mc2 = st.columns(2)
+            with mc1:
+                st.markdown("**State mappings**")
+                if not overrides["states"]:
+                    st.caption("None yet.")
+                else:
+                    for raw, target in sorted(overrides["states"].items()):
+                        rr1, rr2 = st.columns([4, 1])
+                        rr1.write(f"`{raw}` → **{STATE_LABELS.get(target, target.title())}**")
+                        if rr2.button("🗑️", key=f"del_state_alias_{raw}"):
+                            ov = load_alias_overrides()
+                            ov["states"].pop(raw, None)
+                            save_alias_overrides(ov)
+                            st.cache_data.clear()
+                            st.rerun()
+            with mc2:
+                st.markdown("**District mappings**")
+                if not overrides["districts"]:
+                    st.caption("None yet.")
+                else:
+                    for raw, target in sorted(overrides["districts"].items()):
+                        rr1, rr2 = st.columns([4, 1])
+                        label = "🚫 Skip" if target == "_SKIP_" else target.title()
+                        rr1.write(f"`{raw}` → **{label}**")
+                        if rr2.button("🗑️", key=f"del_dist_alias_{raw}"):
+                            ov = load_alias_overrides()
+                            ov["districts"].pop(raw, None)
+                            save_alias_overrides(ov)
+                            st.cache_data.clear()
+                            st.rerun()
+
+            # ── Add a mapping proactively, before it ever shows up as unmatched ──
+            st.markdown("---")
+            st.markdown("#### ➕ Add a Manual Mapping")
+            st.caption("Pre-map a name you already know will appear, without waiting for it to surface as unmatched.")
+            with st.form("manual_alias_form", clear_on_submit=True):
+                mtype = st.radio("Mapping type", ["District", "State"], horizontal=True)
+                raw_input = st.text_input("Raw name (exactly as it appears in the active-district file)")
+                if mtype == "District":
+                    m_state_label = st.selectbox("Belongs to State", sorted_state_labels, key="manual_state_pick")
+                    m_dopts = district_options(label_to_state[m_state_label])
+                    target_label = st.selectbox(
+                        "Maps to Census District", sorted(m_dopts.keys()) if m_dopts else [],
+                        key="manual_dist_pick",
+                    )
+                else:
+                    target_label = st.selectbox("Maps to Census State", sorted_state_labels, key="manual_state_target")
+
+                if st.form_submit_button("💾 Save Mapping"):
+                    raw_clean = raw_input.strip().upper()
+                    if not raw_clean:
+                        st.error("Enter a raw name first.")
+                    else:
+                        ov = load_alias_overrides()
+                        if mtype == "District":
+                            ov["districts"][raw_clean] = m_dopts[target_label]
+                        else:
+                            ov["states"][raw_clean] = label_to_state[target_label]
+                        save_alias_overrides(ov)
+                        st.cache_data.clear()
+                        st.success(f"Saved mapping for '{raw_clean}'.")
+                        st.rerun()
 
     st.markdown("---")
     st.caption("🇮🇳 HMB Presence & Sales Dashboard · Built with Streamlit + Plotly")
