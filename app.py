@@ -266,9 +266,40 @@ FILES = {
 
 TEAM_FILE = "sales_backend_teams.json"   # admin-managed Sales Backend Team ↔ State/District mapping
 
+MONTH_NAMES = ["January","February","March","April","May","June","July",
+               "August","September","October","November","December"]
+
 # ─────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
+def find_month_sale_column(columns):
+    """Locate the 'current month' sale column in the census workbook
+    (e.g. 'June Sale', 'July Sale'). This header changes every month as the
+    sheet gets refreshed, so instead of hardcoding a month name we detect it
+    by pattern — this keeps the dashboard working automatically after each
+    monthly data refresh, with no code change required.
+
+    Returns (column_name, month_name), or (None, None) if nothing matches.
+    """
+    cols = [str(c).strip() for c in columns]
+
+    # 1) Exact "<Month> Sale" match
+    for month in MONTH_NAMES:
+        target = f"{month} Sale".lower()
+        for c in cols:
+            if c.lower() == target:
+                return c, month
+
+    # 2) Fallback: any "<word> Sale" column that isn't a known aggregate
+    known = {"total sale", "gg total sale", "ig total sale"}
+    for c in cols:
+        cl = c.lower()
+        if cl.endswith(" sale") and cl not in known:
+            guess_month = c.split(" ")[0].title()
+            return c, guess_month
+
+    return None, None
+
 def jitter(name, base, spread):
     h = int(hashlib.md5(str(name).encode()).hexdigest()[:4], 16)
     return base + (h / 65535 - 0.5) * spread
@@ -333,15 +364,27 @@ def load_all(_ts):
     raw = pd.read_excel(FILES["census"])
     raw.columns = [str(c).strip() for c in raw.columns]
 
+    # The "current month" sale column's header changes every time the sheet
+    # is refreshed (e.g. "June Sale" → "July Sale"). Detect it by pattern so
+    # the dashboard doesn't break every month — see find_month_sale_column().
+    month_col, month_name = find_month_sale_column(raw.columns)
+    if month_col is None:
+        st.error(
+            "⚠️ Couldn't find a monthly sale column (expected something like "
+            f"'June Sale' or 'July Sale') in **{FILES['census']}**.\n\n"
+            f"Columns found: {', '.join(raw.columns)}"
+        )
+        st.stop()
+
     core = raw[["District code","State name","District name","Population",
                 "KRM","KRO","JN. KRO","Responsible",
-                "Total Sale","last 6 month avg.","June Sale",
+                "Total Sale","last 6 month avg.", month_col,
                 "GG TOTAL SALE","GG AVERAGE OF 6 MONTH",
                 "IG TOTAL SALE","IG AVERAGE OF 6 MONTH"]].copy()
 
     core.columns = ["dist_code","state","district","population",
                     "krm","kro","jn_kro","responsible",
-                    "total_sale","avg_6m","june_sale",
+                    "total_sale","avg_6m","month_sale",
                     "gg_total","gg_avg","ig_total","ig_avg"]
 
     core["state"]    = core["state"].str.strip().str.upper()
@@ -352,7 +395,7 @@ def load_all(_ts):
         core[col] = core[col].fillna("").str.strip().str.upper()
         core[col] = core[col].replace("", None)
 
-    for col in ["total_sale","avg_6m","june_sale","gg_total","gg_avg","ig_total","ig_avg"]:
+    for col in ["total_sale","avg_6m","month_sale","gg_total","gg_avg","ig_total","ig_avg"]:
         core[col] = pd.to_numeric(core[col], errors="coerce")
 
     # ── Custom columns ────────────────────────────────────────
@@ -399,7 +442,7 @@ def load_all(_ts):
     df["lon"]            = df.apply(lambda r: get_coords(r["district"], r["state"])[1], axis=1)
     df["krm_display"]    = df["krm"].fillna("UNASSIGNED")
 
-    return df
+    return df, month_name
 
 def get_ts():
     return tuple(file_mtime(f) for f in FILES.values())
@@ -456,7 +499,7 @@ def dashboard():
         st.session_state["last_ts"] = ts
         st.cache_data.clear()
 
-    df      = load_all(ts)
+    df, month_name = load_all(ts)
     srch_idx= build_search_index(df)
     teams   = load_teams()
     is_admin= st.session_state.get("user","").lower() == "admin"
@@ -687,7 +730,7 @@ def dashboard():
                 flt.groupby("state_label")
                 .agg(Total_Sale=("total_sale","sum"),
                      Avg_6M=("avg_6m","sum"),
-                     June_Sale=("june_sale","sum"),
+                     Month_Sale=("month_sale","sum"),
                      Districts=("district","count"),
                      Active=("status", lambda x:(x=="ACTIVE").sum()))
                 .reset_index().sort_values("Total_Sale", ascending=True)
@@ -705,10 +748,10 @@ def dashboard():
                 hovertemplate="<b>%{y}</b><br>Total: %{x:.1f} MT<extra></extra>",
             ))
             fig_ss.add_trace(go.Bar(
-                y=state_sale["state_label"], x=state_sale["June_Sale"],
-                orientation="h", name="June Sale",
+                y=state_sale["state_label"], x=state_sale["Month_Sale"],
+                orientation="h", name=f"{month_name} Sale",
                 marker_color="#34A853", opacity=0.85,
-                hovertemplate="<b>%{y}</b><br>June: %{x:.1f} MT<extra></extra>",
+                hovertemplate=f"<b>%{{y}}</b><br>{month_name}: %{{x:.1f}} MT<extra></extra>",
             ))
             fig_ss.update_layout(
                 barmode="group", height=340,
@@ -779,9 +822,9 @@ def dashboard():
                 st.info("No GG/IG sales data in current filter.")
 
         with r2c:
-            st.markdown('<div class="sec">📉 June vs 6M Avg</div>', unsafe_allow_html=True)
-            comp = flt[flt["total_sale"].notna()][["district_title","june_sale","avg_6m"]].copy()
-            comp = comp.dropna(subset=["june_sale","avg_6m"]).nlargest(12,"avg_6m")
+            st.markdown(f'<div class="sec">📉 {month_name} vs 6M Avg</div>', unsafe_allow_html=True)
+            comp = flt[flt["total_sale"].notna()][["district_title","month_sale","avg_6m"]].copy()
+            comp = comp.dropna(subset=["month_sale","avg_6m"]).nlargest(12,"avg_6m")
             if not comp.empty:
                 fig_comp = go.Figure()
                 fig_comp.add_trace(go.Bar(
@@ -789,8 +832,8 @@ def dashboard():
                     name="6M Avg", marker_color="#90CAF9",
                 ))
                 fig_comp.add_trace(go.Bar(
-                    x=comp["district_title"], y=comp["june_sale"],
-                    name="June Sale", marker_color="#1565C0",
+                    x=comp["district_title"], y=comp["month_sale"],
+                    name=f"{month_name} Sale", marker_color="#1565C0",
                 ))
                 fig_comp.update_layout(
                     barmode="group", height=240,
@@ -812,7 +855,7 @@ def dashboard():
                 Active=("status",lambda x:(x=="ACTIVE").sum()),
                 Total_Sale=("total_sale","sum"),
                 Avg_6M=("avg_6m","sum"),
-                June_Sale=("june_sale","sum"),
+                Month_Sale=("month_sale","sum"),
                 GG_Total=("gg_total","sum"),
                 IG_Total=("ig_total","sum"),
                 States=("state_label",lambda x:", ".join(sorted(set(x)))),
@@ -821,13 +864,13 @@ def dashboard():
         krm_perf["Coverage%"] = krm_perf.apply(
             lambda r: safe_div(r["Active"],r["Districts"]),axis=1)
         krm_perf["vs_avg"] = krm_perf.apply(
-            lambda r: safe_div(r["June_Sale"],r["Avg_6M"]/6) - 100
+            lambda r: safe_div(r["Month_Sale"],r["Avg_6M"]/6) - 100
             if pd.notna(r["Avg_6M"]) and r["Avg_6M"]>0 else None, axis=1)
 
         st.dataframe(
             krm_perf.rename(columns={
                 "krm_display":"KRM","Districts":"Dists","Active":"✅Active",
-                "Total_Sale":"Total (MT)","Avg_6M":"6M Avg (MT)","June_Sale":"June (MT)",
+                "Total_Sale":"Total (MT)","Avg_6M":"6M Avg (MT)","Month_Sale":f"{month_name} (MT)",
                 "GG_Total":"GG (MT)","IG_Total":"IG (MT)","Coverage%":"Cover%",
                 "vs_avg":"vs Avg%","States":"States"
             }).sort_values("Total (MT)",ascending=False),
@@ -1041,8 +1084,8 @@ def dashboard():
         if an_df.empty:
             st.info("No sufficient sales data in the current filter for analysis. Adjust slicers.")
         else:
-            # Growth% = how June sale compares to the monthly-equivalent 6M average
-            an_df["growth_pct"] = ((an_df["june_sale"] - an_df["avg_6m"]/6) / (an_df["avg_6m"]/6) * 100).round(1)
+            # Growth% = how this month's sale compares to the monthly-equivalent 6M average
+            an_df["growth_pct"] = ((an_df["month_sale"] - an_df["avg_6m"]/6) / (an_df["avg_6m"]/6) * 100).round(1)
             an_df["sale_per_lakh_pop"] = an_df.apply(
                 lambda r: round(r["total_sale"]/(r["population"]/1e5), 2) if r["population"] > 0 else 0, axis=1)
 
@@ -1096,16 +1139,16 @@ def dashboard():
 
             with g3:
                 st.markdown('<div class="sec">🚀 Top 10 Gainers (Growth %)</div>', unsafe_allow_html=True)
-                gainers = an_df.nlargest(10, "growth_pct")[["district_title","state_label","krm_display","growth_pct","june_sale"]]
+                gainers = an_df.nlargest(10, "growth_pct")[["district_title","state_label","krm_display","growth_pct","month_sale"]]
                 gainers = gainers.rename(columns={"district_title":"District","state_label":"State",
-                                                   "krm_display":"KRM","growth_pct":"Growth %","june_sale":"June (MT)"})
+                                                   "krm_display":"KRM","growth_pct":"Growth %","month_sale":f"{month_name} (MT)"})
                 st.dataframe(gainers.reset_index(drop=True), use_container_width=True, height=340)
 
             with g4:
                 st.markdown('<div class="sec">🔻 Top 10 Decliners (Growth %)</div>', unsafe_allow_html=True)
-                decl = an_df.nsmallest(10, "growth_pct")[["district_title","state_label","krm_display","growth_pct","june_sale"]]
+                decl = an_df.nsmallest(10, "growth_pct")[["district_title","state_label","krm_display","growth_pct","month_sale"]]
                 decl = decl.rename(columns={"district_title":"District","state_label":"State",
-                                             "krm_display":"KRM","growth_pct":"Growth %","june_sale":"June (MT)"})
+                                             "krm_display":"KRM","growth_pct":"Growth %","month_sale":f"{month_name} (MT)"})
                 st.dataframe(decl.reset_index(drop=True), use_container_width=True, height=340)
 
             # Pareto (80/20) analysis
@@ -1149,10 +1192,10 @@ def dashboard():
             st.dataframe(bench.reset_index(drop=True), use_container_width=True, height=260)
             st.download_button("⬇️ Download Analysis CSV",
                                data=an_df[["state_label","district_title","krm_display","total_sale",
-                                           "avg_6m","june_sale","growth_pct","sale_per_lakh_pop"]]
+                                           "avg_6m","month_sale","growth_pct","sale_per_lakh_pop"]]
                                    .rename(columns={"state_label":"State","district_title":"District",
                                                      "krm_display":"KRM","total_sale":"Total_MT","avg_6m":"6MAvg_MT",
-                                                     "june_sale":"June_MT","growth_pct":"Growth%",
+                                                     "month_sale":f"{month_name}_MT","growth_pct":"Growth%",
                                                      "sale_per_lakh_pop":"MTperLakhPop"})
                                    .to_csv(index=False),
                                file_name="analysis.csv", mime="text/csv")
@@ -1172,7 +1215,7 @@ def dashboard():
             s1,s2,s3,s4 = st.columns(4)
             s1.metric("Total Sale (MT)",  f"{sales_df['total_sale'].sum():,.1f}")
             s2.metric("6M Avg (MT)",      f"{sales_df['avg_6m'].sum():,.1f}")
-            s3.metric("June Sale (MT)",   f"{sales_df['june_sale'].sum():,.1f}")
+            s3.metric(f"{month_name} Sale (MT)", f"{sales_df['month_sale'].sum():,.1f}")
             s4.metric("Districts w/ Sale", len(sales_df))
 
             st.markdown("<br>", unsafe_allow_html=True)
@@ -1237,11 +1280,11 @@ def dashboard():
             st.markdown('<div class="sec">📋 District Sales Detail</div>', unsafe_allow_html=True)
             sale_tbl = sales_df[[
                 "state_label","district_title","krm_display","kro","jn_kro",
-                "total_sale","avg_6m","june_sale","gg_total","gg_avg","ig_total","ig_avg"
+                "total_sale","avg_6m","month_sale","gg_total","gg_avg","ig_total","ig_avg"
             ]].rename(columns={
                 "state_label":"State","district_title":"District","krm_display":"KRM",
                 "kro":"KRO","jn_kro":"JR.KRO",
-                "total_sale":"Total (MT)","avg_6m":"6M Avg (MT)","june_sale":"June (MT)",
+                "total_sale":"Total (MT)","avg_6m":"6M Avg (MT)","month_sale":f"{month_name} (MT)",
                 "gg_total":"GG (MT)","gg_avg":"GG Avg (MT)","ig_total":"IG (MT)","ig_avg":"IG Avg (MT)"
             }).sort_values("Total (MT)",ascending=False).reset_index(drop=True)
 
@@ -1281,9 +1324,9 @@ def dashboard():
                         st.markdown(f"&nbsp;&nbsp;&nbsp;&nbsp;👶 JR.KRO: **{jr_name}** → {dists}")
 
                 # Districts table for this KRM
-                ktbl = kgrp[["district_title","state_label","status","total_sale","june_sale","kro","jn_kro"]].rename(
+                ktbl = kgrp[["district_title","state_label","status","total_sale","month_sale","kro","jn_kro"]].rename(
                     columns={"district_title":"District","state_label":"State",
-                             "status":"Status","total_sale":"Total (MT)","june_sale":"June (MT)",
+                             "status":"Status","total_sale":"Total (MT)","month_sale":f"{month_name} (MT)",
                              "kro":"KRO","jn_kro":"JR.KRO"}
                 ).sort_values("Total (MT)",ascending=False).reset_index(drop=True)
                 st.dataframe(ktbl, use_container_width=True, height=220)
@@ -1302,12 +1345,12 @@ def dashboard():
 
         disp = tbl[[
             "state_label","district_title","krm_display","kro","jn_kro","responsible",
-            "population","total_sale","avg_6m","june_sale","gg_total","ig_total","status"
+            "population","total_sale","avg_6m","month_sale","gg_total","ig_total","status"
         ]].rename(columns={
             "state_label":"State","district_title":"District","krm_display":"KRM",
             "kro":"KRO","jn_kro":"JR.KRO","responsible":"Responsible",
             "population":"Population","total_sale":"Total (MT)","avg_6m":"6M Avg (MT)",
-            "june_sale":"June (MT)","gg_total":"GG (MT)","ig_total":"IG (MT)","status":"Status"
+            "month_sale":f"{month_name} (MT)","gg_total":"GG (MT)","ig_total":"IG (MT)","status":"Status"
         }).sort_values("Total (MT)",ascending=False).reset_index(drop=True)
 
         def status_style(val):
