@@ -12,12 +12,13 @@ Run:  streamlit run app.py
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 import plotly.express as px
 import hashlib
 import os
 import json
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 # ─────────────────────────────────────────────────────────────────────────────
 # PAGE CONFIG
@@ -77,7 +78,7 @@ st.markdown("""
 # AUTH
 # ─────────────────────────────────────────────────────────────────────────────
 USERS = {
-    "admin":   hashlib.sha256("admin@2026".encode()).hexdigest(),
+    "sudipta":  hashlib.sha256("sudipta@2026".encode()).hexdigest(),
     "manager": hashlib.sha256("krm@2026".encode()).hexdigest(),
     "viewer":  hashlib.sha256("view@2026".encode()).hexdigest(),
 }
@@ -98,18 +99,18 @@ def login_page():
           </div>
         </div>"""), unsafe_allow_html=True)
         with st.form("login"):
-            u = st.text_input("Username", placeholder="admin / manager / viewer")
+            u = st.text_input("Username", placeholder="sudipta / manager / viewer")
             p = st.text_input("Password", type="password")
             if st.form_submit_button("🔐  Sign In", use_container_width=True):
                 if check_pw(u, p):
                     st.session_state.update({
                         "auth": True, "user": u,
-                        "login_time": datetime.now().strftime("%d %b %Y %H:%M"),
+                        "login_time": datetime.now(timezone.utc).astimezone(IST).strftime("%d %b %Y %H:%M") + " IST",
                     })
                     st.rerun()
                 else:
                     st.error("❌ Wrong credentials")
-        st.caption("Demo:  admin / admin@2026")
+        st.caption("DEVELOPED BY SUDIPTA CHATTERJEE")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
@@ -338,18 +339,48 @@ def html_block(s: str) -> str:
 def safe_div(a, b):
     return round(a / b * 100, 1) if b else 0
 
+def forecast_next_month(monthly_state_df):
+    """Simple linear-trend projection of next month's QTY per state, from a
+    (state, month, QTY) series. Not a trained ML model — a transparent,
+    explainable trend line — but useful as an early-warning signal. Needs
+    at least 2 distinct months of data per state to fit a trend; states
+    with only 1 month get their forecast set equal to that month's value.
+    Returns a DataFrame: state, last_month, last_actual, forecast_next, trend_pct.
+    """
+    rows = []
+    for state, g in monthly_state_df.groupby("state"):
+        g = g.sort_values("month")
+        y = g["QTY"].to_numpy(dtype=float)
+        last_month = g["month"].iloc[-1]
+        last_actual = y[-1]
+        if len(y) >= 2:
+            x = np.arange(len(y))
+            slope, intercept = np.polyfit(x, y, 1)
+            forecast = max(0.0, slope * len(y) + intercept)
+        else:
+            forecast = last_actual
+        trend_pct = safe_div(forecast - last_actual, last_actual) if last_actual else 0
+        rows.append({
+            "state": state, "last_month": last_month, "last_actual": last_actual,
+            "forecast_next": forecast, "trend_pct": trend_pct, "months_of_data": len(y),
+        })
+    return pd.DataFrame(rows).sort_values("forecast_next", ascending=False)
+
 def file_mtime(path):
     return os.path.getmtime(path) if os.path.exists(path) else 0
 
+IST = timezone(timedelta(hours=5, minutes=30))
+
 def get_last_update_str():
-    """Human-readable date/time of the most recently updated data file."""
+    """Human-readable date/time (India, +5:30) of the most recently updated data file."""
     keys = ["census", "active", "custom"]
     mtimes = [file_mtime(FILES[k]) for k in keys if file_mtime(FILES[k]) > 0]
     if file_mtime(SALES_SOURCE_FILE) > 0:
         mtimes.append(file_mtime(SALES_SOURCE_FILE))
     if not mtimes:
         return "No data uploaded yet"
-    return datetime.fromtimestamp(max(mtimes)).strftime("%d %b %Y · %I:%M %p")
+    ist_dt = datetime.fromtimestamp(max(mtimes), tz=timezone.utc).astimezone(IST)
+    return ist_dt.strftime("%d %b %Y · %I:%M %p") + " IST"
 
 # ─────────────────────────────────────────────────────────────────────────────
 # SALES BACKEND TEAM  (admin-managed State / District mapping)
@@ -424,13 +455,13 @@ def compute_invoice_sales(path, state_alias, dist_alias):
     (None, None, None, 0) if no file / no usable rows.
     """
     if not path or not os.path.exists(path):
-        return None, None, None, 0
+        return None, None, None, 0, None
 
     try:
         inv = pd.read_csv(path) if str(path).lower().endswith(".csv") else pd.read_excel(path)
     except Exception as e:
         st.error(f"⚠️ Couldn't read the sales data file: {e}")
-        return None, None, None, 0
+        return None, None, None, 0, None
 
     inv.columns = [str(c).strip().upper() for c in inv.columns]
 
@@ -455,7 +486,7 @@ def compute_invoice_sales(path, state_alias, dist_alias):
             "⚠️ Sales data file is missing required column(s): "
             f"**{', '.join(missing)}**.\n\nColumns found: {', '.join(inv.columns)}"
         )
-        return None, None, None, 0
+        return None, None, None, 0, None
 
     inv = inv.rename(columns={col_state: "STATE", col_district: "DISTRICT_RAW",
                                col_qty: "QTY", col_date: "DATE"})
@@ -468,7 +499,7 @@ def compute_invoice_sales(path, state_alias, dist_alias):
     inv = inv.dropna(subset=["DATE"])
     row_count = len(inv)
     if inv.empty:
-        return None, None, None, 0
+        return None, None, None, 0, None
 
     inv["state_norm"] = inv["STATE"].map(lambda s: state_alias.get(s, s))
     inv["dist_norm"]  = inv["DISTRICT_RAW"].map(lambda d: dist_alias.get(d, d))
@@ -501,7 +532,15 @@ def compute_invoice_sales(path, state_alias, dist_alias):
         .reset_index(drop=True)
     )
 
-    return agg, month_name, unmatched, row_count
+    # Monthly state-level series (for the simple trend forecast) — state level
+    # gives more data points per series than per-district would.
+    monthly_state = (
+        inv.groupby(["state_norm", "month_period"])["QTY"].sum()
+        .reset_index().rename(columns={"state_norm": "state", "month_period": "month"})
+    )
+    monthly_state["month"] = monthly_state["month"].astype(str)
+
+    return agg, month_name, unmatched, row_count, monthly_state
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -519,7 +558,7 @@ def load_all(_ts):
 
     # ── Sales figures: prefer an admin-uploaded raw invoice file if present,
     #    otherwise fall back to the pre-built sale columns in the census sheet.
-    invoice_agg, invoice_month, invoice_unmatched, invoice_rows = compute_invoice_sales(
+    invoice_agg, invoice_month, invoice_unmatched, invoice_rows, invoice_monthly_state = compute_invoice_sales(
         SALES_SOURCE_FILE, state_alias, dist_alias
     )
     using_invoice_data = invoice_agg is not None
@@ -554,6 +593,9 @@ def load_all(_ts):
                         "krm","kro","jn_kro","responsible",
                         "total_sale","avg_6m","month_sale",
                         "gg_total","gg_avg","ig_total","ig_avg"]
+
+    # Drop any fully-blank trailing rows in the census sheet (no state/district)
+    core = core.dropna(subset=["state","district"]).copy()
 
     core["state"]    = core["state"].str.strip().str.upper()
     core["district"] = core["district"].str.strip().str.upper()
@@ -647,6 +689,7 @@ def load_all(_ts):
     sales_source_info = {
         "using_invoice_data": using_invoice_data,
         "invoice_rows": invoice_rows,
+        "monthly_state": invoice_monthly_state if using_invoice_data else None,
     }
 
     return df, month_name, unmatched_locations, census_districts, sales_source_info
@@ -709,7 +752,7 @@ def dashboard():
     df, month_name, unmatched_locations, census_districts, sales_source_info = load_all(ts)
     srch_idx= build_search_index(df)
     teams   = load_teams()
-    is_admin= st.session_state.get("user","").lower() == "admin"
+    is_admin= st.session_state.get("user","").lower() == "sudipta"
 
     # ── SESSION: search jump state ────────────────────────────
     if "jump_filter" not in st.session_state:
@@ -719,47 +762,6 @@ def dashboard():
     with st.sidebar:
         st.markdown(f"### 👤 {st.session_state['user'].title()}")
         st.caption(f"Logged in: {st.session_state.get('login_time','')}")
-        if st.button("🚪 Logout", use_container_width=True):
-            st.session_state.clear(); st.rerun()
-        st.markdown("---")
-
-        # ════════════════════════════════════════════════════
-        # 🔍  SMART SEARCH
-        # ════════════════════════════════════════════════════
-        st.markdown("### 🔍 Smart Search")
-        st.caption("Search KRM · KRO · JR.KRO · District · State")
-        query = st.text_input("", placeholder="Type name or place…", label_visibility="collapsed", key="global_search")
-
-        if query and len(query.strip()) >= 2:
-            mask = srch_idx["name"].str.contains(query.strip(), case=False, na=False)
-            results = srch_idx[mask].head(12)
-            if results.empty:
-                st.caption("No results found.")
-            else:
-                for _, r in results.iterrows():
-                    color = ROLE_COLORS.get(r["role"], "#888")
-                    label = f"[{r['role']}]  {r['name']}"
-                    if st.button(label, key=f"sr_{r['role']}_{r['name']}", use_container_width=True):
-                        st.session_state["jump_filter"] = {
-                            r["filter_col"]: r["filter_val"]
-                        }
-                        st.session_state["global_search"] = ""
-                        st.rerun()
-                    st.caption(r["detail"])
-
-        if st.session_state["jump_filter"]:
-            jf = st.session_state["jump_filter"]
-            jkey = list(jf.keys())[0]
-            jval = list(jf.values())[0]
-            st.markdown(
-                f'<div style="background:#e8f0fe;border-radius:8px;padding:6px 10px;'
-                f'font-size:11px;color:#1a73e8;margin-top:4px;">'
-                f'🎯 Showing: <b>{jval}</b></div>', unsafe_allow_html=True
-            )
-            if st.button("✖ Clear search filter", use_container_width=True):
-                st.session_state["jump_filter"] = {}
-                st.rerun()
-
         st.markdown("---")
 
         # ════════════════════════════════════════════════════
@@ -787,6 +789,9 @@ def dashboard():
         jrkro_avail   = ["All JR.KROs"] + sorted([k for k in df["jn_kro"].dropna().unique()])
         sel_jrkro     = st.selectbox("👶 JR.KRO", jrkro_avail)
 
+        team_opts = ["— All / No Team —"] + sorted(teams.keys())
+        sel_team  = st.selectbox("🧑‍💼 Sales Backend Team", team_opts, key="team_jump_select")
+
         # District depends on above
         pool = df.copy()
         if sel_presence != "All":        pool = pool[pool["status"]       == sel_presence]
@@ -810,18 +815,51 @@ def dashboard():
             st.rerun()
         auto = st.toggle("Auto-refresh 30s", value=False)
 
-    # ── TOP TOOLBAR: last update (left) + Sales Backend Team slicer (right) ──
-    tb_l, tb_r = st.columns([2.2, 1.3])
-    with tb_l:
+    # ── TOP HEADER: last update (left) · Smart Search + Login/Logout (right) ──
+    hdr_l, hdr_r1, hdr_r2 = st.columns([3, 1.3, 1])
+    with hdr_l:
         st.markdown(
-            f'<div style="font-size:12px;color:#555;padding-top:6px;">'
-            f'🕒 <b>Last data update:</b> {get_last_update_str()}</div>',
+            f'<div style="font-size:13px;color:#555;padding-top:12px;">'
+            f'🕒 <b>Last data update (IST):</b> {get_last_update_str()}</div>',
             unsafe_allow_html=True,
         )
-    with tb_r:
-        team_opts = ["— All / No Team —"] + sorted(teams.keys())
-        sel_team  = st.selectbox("🧑‍💼 Sales Backend Team", team_opts,
-                                  key="team_jump_select", label_visibility="collapsed")
+    with hdr_r1:
+        with st.popover("🔍 Smart Search", use_container_width=True):
+            st.caption("Search KRM · KRO · JR.KRO · District · State")
+            query = st.text_input("", placeholder="Type name or place…", label_visibility="collapsed", key="global_search")
+
+            if query and len(query.strip()) >= 2:
+                mask = srch_idx["name"].str.contains(query.strip(), case=False, na=False)
+                results = srch_idx[mask].head(12)
+                if results.empty:
+                    st.caption("No results found.")
+                else:
+                    for _, r in results.iterrows():
+                        label = f"[{r['role']}]  {r['name']}"
+                        if st.button(label, key=f"sr_{r['role']}_{r['name']}", use_container_width=True):
+                            st.session_state["jump_filter"] = {
+                                r["filter_col"]: r["filter_val"]
+                            }
+                            st.session_state["global_search"] = ""
+                            st.rerun()
+                        st.caption(r["detail"])
+
+            if st.session_state["jump_filter"]:
+                jf_disp = st.session_state["jump_filter"]
+                jval_disp = list(jf_disp.values())[0]
+                st.markdown(
+                    f'<div style="background:#e8f0fe;border-radius:8px;padding:6px 10px;'
+                    f'font-size:11px;color:#1a73e8;margin-top:4px;">'
+                    f'🎯 Showing: <b>{jval_disp}</b></div>', unsafe_allow_html=True
+                )
+                if st.button("✖ Clear search filter", use_container_width=True):
+                    st.session_state["jump_filter"] = {}
+                    st.rerun()
+    with hdr_r2:
+        with st.popover(f"👤 {st.session_state['user'].title()}", use_container_width=True):
+            st.caption(f"Logged in: {st.session_state.get('login_time','')}")
+            if st.button("🚪 Logout", use_container_width=True, key="logout_top"):
+                st.session_state.clear(); st.rerun()
 
     # ── Build final filter ────────────────────────────────────
     jf  = st.session_state.get("jump_filter", {})
@@ -853,6 +891,130 @@ def dashboard():
     # ── Auto-refresh ──────────────────────────────────────────
     if auto:
         import time; time.sleep(30); st.rerun()
+
+    # ═══════════════════════════════════════════════════════════
+    # TOP SECTION — HMB PRESENCE MAP
+    # ═══════════════════════════════════════════════════════════
+    map_col, cov_col = st.columns([3, 1])
+
+    with map_col:
+        st.markdown('<div class="sec">🗺️ HMB Presence Map</div>', unsafe_allow_html=True)
+        fig_top = go.Figure()
+
+        # Auto-enable district labels when a single state is drilled into,
+        # so the full state + all its districts are clearly visible.
+        effective_show_lbl = show_lbl or (sel_state != "All States")
+        hover_fields = flt[["district_title","state_label","krm_display","kro","jn_kro","responsible"]] \
+            .fillna("—").values
+
+        if map_color == "Presence Status":
+            for status, color in [("ACTIVE","#34A853"),("NO PRESENCE","#EA4335")]:
+                g = flt[flt["status"]==status]
+                if g.empty: continue
+                fig_top.add_trace(go.Scattermapbox(
+                    lat=g["lat"], lon=g["lon"],
+                    mode="markers+text" if effective_show_lbl else "markers",
+                    marker=dict(size=11, color=color, opacity=0.85),
+                    text=g["district_title"] if effective_show_lbl else None,
+                    textposition="top center", textfont=dict(size=8,color="#222"),
+                    name=status,
+                    hovertemplate=(
+                        "<b>%{customdata[0]}</b><br>State: %{customdata[1]}<br>"
+                        "KRM: %{customdata[2]}<br>KRO: %{customdata[3]}<br>"
+                        "JR.KRO: %{customdata[4]}<br>Responsible: %{customdata[5]}"
+                        "<extra></extra>"
+                    ),
+                    customdata=g[["district_title","state_label","krm_display","kro","jn_kro","responsible"]].fillna("—").values,
+                ))
+        elif map_color == "KRM Territory":
+            for krm_name, g in flt.groupby("krm_display"):
+                color = KRM_COLORS.get(krm_name, "#B0BEC5")
+                fig_top.add_trace(go.Scattermapbox(
+                    lat=g["lat"], lon=g["lon"],
+                    mode="markers+text" if effective_show_lbl else "markers",
+                    marker=dict(size=10, color=color, opacity=0.85),
+                    text=g["district_title"] if effective_show_lbl else None,
+                    textposition="top center", textfont=dict(size=8,color="#222"),
+                    name=krm_name,
+                    hovertemplate=(
+                        "<b>%{customdata[0]}</b><br>State: %{customdata[1]}<br>"
+                        "KRM: <b>%{customdata[2]}</b><br>KRO: %{customdata[3]}<br>"
+                        "JR.KRO: %{customdata[4]}<br>Responsible: %{customdata[5]}"
+                        "<extra></extra>"
+                    ),
+                    customdata=g[["district_title","state_label","krm_display","kro","jn_kro","responsible"]].fillna("—").values,
+                ))
+        else:
+            import plotly.colors as pc
+            smax = flt["population"].max() if not flt.empty else 1
+            nc   = pc.sample_colorscale(pc.sequential.YlOrRd,
+                   (flt["population"]/(smax or 1)).clip(0,1).fillna(0).tolist())
+            sizes= (flt["population"]/(smax or 1)*16+5).clip(5,21)
+            fig_top.add_trace(go.Scattermapbox(
+                lat=flt["lat"], lon=flt["lon"],
+                mode="markers+text" if effective_show_lbl else "markers",
+                marker=dict(size=sizes.tolist(), color=nc, opacity=0.85),
+                text=flt["district_title"] if effective_show_lbl else None,
+                textposition="top center", textfont=dict(size=8,color="#222"),
+                name="Population",
+                hovertemplate=(
+                    "<b>%{customdata[0]}</b><br>State: %{customdata[1]}<br>"
+                    "KRM: %{customdata[2]}<br>KRO: %{customdata[3]}<br>"
+                    "JR.KRO: %{customdata[4]}<br>Responsible: %{customdata[5]}"
+                    "<extra></extra>"
+                ),
+                customdata=flt[["district_title","state_label","krm_display","kro","jn_kro","responsible"]].fillna("—").values,
+            ))
+
+        zoom, clat, clon = 4.2, 23.5, 84.0
+        if sel_state != "All States":
+            # Center on the mean of the state's own districts (tighter & more
+            # accurate than the static state centroid) so the full state map
+            # with all its districts fills the view.
+            if not flt.empty:
+                clat, clon = float(flt["lat"].mean()), float(flt["lon"].mean())
+            else:
+                sk = [k for k,v in STATE_LABELS.items() if v==sel_state]
+                if sk and sk[0] in STATE_CENTROIDS:
+                    clat,clon = STATE_CENTROIDS[sk[0]]
+            zoom = 6.8
+        if sel_dist != "All Districts" and not flt.empty:
+            clat,clon = float(flt["lat"].mean()),float(flt["lon"].mean()); zoom=9.0
+
+        fig_top.update_layout(
+            mapbox=dict(style=map_style,zoom=zoom,center=dict(lat=clat,lon=clon)),
+            legend=dict(bgcolor="rgba(255,255,255,.92)",bordercolor="#ddd",
+                        borderwidth=1,font=dict(size=11),x=0.01,y=0.99),
+            margin=dict(l=0,r=0,t=0,b=0), height=520,
+        )
+        st.plotly_chart(fig_top, use_container_width=True)
+        cap = "🟢 Active  ·  🔴 No Presence  ·  Hover for KRM / KRO / JR.KRO / Responsible"
+        if sel_state != "All States":
+            cap += f"  ·  📍 Zoomed to **{sel_state}** — all districts labeled"
+        st.caption(cap)
+
+    with cov_col:
+        st.markdown('<div class="sec">Coverage</div>', unsafe_allow_html=True)
+        sp = flt.groupby(["state_label","status"]).size().unstack(fill_value=0).reset_index()
+        for c in ["ACTIVE","NO PRESENCE"]:
+            if c not in sp.columns: sp[c]=0
+        for _, row in sp.iterrows():
+            a=int(row.get("ACTIVE",0)); np2=int(row.get("NO PRESENCE",0))
+            tot=a+np2; p2=int(a/tot*100) if tot else 0
+            bc="#34A853" if p2>=60 else "#FBBC04" if p2>=30 else "#EA4335"
+            st.markdown(html_block(f"""
+            <div class="cov-row">
+              <div style="font-weight:700;font-size:12px;">{row['state_label']}</div>
+              <div style="display:flex;justify-content:space-between;font-size:10px;color:#666;margin:3px 0;">
+                <span>✅{a} &nbsp;🔴{np2}</span>
+                <span style="color:{bc};font-weight:700;">{p2}%</span>
+              </div>
+              <div class="cov-bar-bg">
+                <div style="background:{bc};width:{p2}%;height:5px;border-radius:5px;"></div>
+              </div>
+            </div>"""), unsafe_allow_html=True)
+
+    st.markdown("<br>", unsafe_allow_html=True)
 
     # ── Banner ────────────────────────────────────────────────
     active_n = int((flt["status"]=="ACTIVE").sum())
@@ -908,12 +1070,10 @@ def dashboard():
     # ═══════════════════════════════════════════════════════════
     tab_names = [
         "📊 Live Dashboard",
-        "🗺️ India Map",
         "📍 Presence Analysis",
-        "📈 Analysis",
         "📦 Product Sales",
         "👥 Team View",
-        "📋 Data Table",
+        "📋 Data Table (Sales Backend Team)",
     ]
     if is_admin:
         tab_names.append("🛠️ Sales Backend Teams (Admin)")
@@ -921,10 +1081,10 @@ def dashboard():
         tab_names.append("📤 Sales Data (Admin)")
 
     _tabs = st.tabs(tab_names)
-    tab_live, tab_map, tab_pres, tab_analysis, tab_sales, tab_team, tab_table = _tabs[:7]
-    tab_admin   = _tabs[7] if is_admin else None
-    tab_mapping = _tabs[8] if is_admin else None
-    tab_sales_up= _tabs[9] if is_admin else None
+    tab_live, tab_pres, tab_sales, tab_team, tab_table = _tabs[:5]
+    tab_admin   = _tabs[5] if is_admin else None
+    tab_mapping = _tabs[6] if is_admin else None
+    tab_sales_up= _tabs[7] if is_admin else None
 
     # ═══════════════════════════════════════════════════════════
     # TAB 1 — LIVE DASHBOARD (Power-BI style)
@@ -1089,126 +1249,6 @@ def dashboard():
         )
 
     # ═══════════════════════════════════════════════════════════
-    # TAB 2 — MAP
-    # ═══════════════════════════════════════════════════════════
-    with tab_map:
-        col_map, col_side = st.columns([3,1])
-
-        with col_map:
-            st.markdown('<div class="sec">📍 District Map</div>', unsafe_allow_html=True)
-            fig = go.Figure()
-
-            # Auto-enable district labels when a single state is drilled into,
-            # so the full state + all its districts are clearly visible.
-            effective_show_lbl = show_lbl or (sel_state != "All States")
-
-            if map_color == "Presence Status":
-                for status, color in [("ACTIVE","#34A853"),("NO PRESENCE","#EA4335")]:
-                    g = flt[flt["status"]==status]
-                    if g.empty: continue
-                    fig.add_trace(go.Scattermapbox(
-                        lat=g["lat"], lon=g["lon"],
-                        mode="markers+text" if effective_show_lbl else "markers",
-                        marker=dict(size=11, color=color, opacity=0.85),
-                        text=g["district_title"] if effective_show_lbl else None,
-                        textposition="top center", textfont=dict(size=8,color="#222"),
-                        name=status,
-                        hovertemplate=(
-                            "<b>%{customdata[0]}</b><br>State: %{customdata[1]}<br>"
-                            "KRM: %{customdata[2]}<br>KRO: %{customdata[3]}<br>"
-                            "Pop: %{customdata[4]}<br>Sale: %{customdata[5]:.1f} MT<br>"
-                            "<b>%{customdata[6]}</b><extra></extra>"
-                        ),
-                        customdata=g[["district_title","state_label","krm_display","kro","pop_fmt","total_sale","status"]].values,
-                    ))
-            elif map_color == "KRM Territory":
-                for krm_name, g in flt.groupby("krm_display"):
-                    color = KRM_COLORS.get(krm_name, "#B0BEC5")
-                    fig.add_trace(go.Scattermapbox(
-                        lat=g["lat"], lon=g["lon"],
-                        mode="markers+text" if effective_show_lbl else "markers",
-                        marker=dict(size=10, color=color, opacity=0.85),
-                        text=g["district_title"] if effective_show_lbl else None,
-                        textposition="top center", textfont=dict(size=8,color="#222"),
-                        name=krm_name,
-                        hovertemplate=(
-                            "<b>%{customdata[0]}</b><br>State: %{customdata[1]}<br>"
-                            "KRM: <b>%{customdata[2]}</b><br>KRO: %{customdata[3]}<br>"
-                            "Pop: %{customdata[4]}<br>Sale: %{customdata[5]:.1f} MT<br>"
-                            "Status: %{customdata[6]}<extra></extra>"
-                        ),
-                        customdata=g[["district_title","state_label","krm_display","kro","pop_fmt","total_sale","status"]].values,
-                    ))
-            else:
-                import plotly.colors as pc
-                smax = flt["population"].max() if not flt.empty else 1
-                nc   = pc.sample_colorscale(pc.sequential.YlOrRd,
-                       (flt["population"]/(smax or 1)).clip(0,1).fillna(0).tolist())
-                sizes= (flt["population"]/(smax or 1)*16+5).clip(5,21)
-                fig.add_trace(go.Scattermapbox(
-                    lat=flt["lat"], lon=flt["lon"],
-                    mode="markers+text" if effective_show_lbl else "markers",
-                    marker=dict(size=sizes.tolist(), color=nc, opacity=0.85),
-                    text=flt["district_title"] if effective_show_lbl else None,
-                    textposition="top center", textfont=dict(size=8,color="#222"),
-                    name="Population",
-                    hovertemplate=(
-                        "<b>%{customdata[0]}</b><br>State: %{customdata[1]}<br>"
-                        "Pop: %{customdata[4]}<br>Sale: %{customdata[5]:.1f} MT<br>"
-                        "Status: %{customdata[6]}<extra></extra>"
-                    ),
-                    customdata=flt[["district_title","state_label","krm_display","kro","pop_fmt","total_sale","status"]].values,
-                ))
-
-            zoom, clat, clon = 4.2, 23.5, 84.0
-            if sel_state != "All States":
-                # Center on the mean of the state's own districts (tighter & more
-                # accurate than the static state centroid) so the full state map
-                # with all its districts fills the view.
-                if not flt.empty:
-                    clat, clon = float(flt["lat"].mean()), float(flt["lon"].mean())
-                else:
-                    sk = [k for k,v in STATE_LABELS.items() if v==sel_state]
-                    if sk and sk[0] in STATE_CENTROIDS:
-                        clat,clon = STATE_CENTROIDS[sk[0]]
-                zoom = 6.8
-            if sel_dist != "All Districts" and not flt.empty:
-                clat,clon = float(flt["lat"].mean()),float(flt["lon"].mean()); zoom=9.0
-
-            fig.update_layout(
-                mapbox=dict(style=map_style,zoom=zoom,center=dict(lat=clat,lon=clon)),
-                legend=dict(bgcolor="rgba(255,255,255,.92)",bordercolor="#ddd",
-                            borderwidth=1,font=dict(size=11),x=0.01,y=0.99),
-                margin=dict(l=0,r=0,t=0,b=0), height=570,
-            )
-            st.plotly_chart(fig, use_container_width=True)
-            cap = "🟢 Active  ·  🔴 No Presence  ·  Hover for full details"
-            if sel_state != "All States":
-                cap += f"  ·  📍 Zoomed to **{sel_state}** — all districts labeled"
-            st.caption(cap)
-
-        with col_side:
-            st.markdown('<div class="sec">Coverage</div>', unsafe_allow_html=True)
-            sp = flt.groupby(["state_label","status"]).size().unstack(fill_value=0).reset_index()
-            for c in ["ACTIVE","NO PRESENCE"]:
-                if c not in sp.columns: sp[c]=0
-            for _, row in sp.iterrows():
-                a=int(row.get("ACTIVE",0)); np2=int(row.get("NO PRESENCE",0))
-                tot=a+np2; p2=int(a/tot*100) if tot else 0
-                bc="#34A853" if p2>=60 else "#FBBC04" if p2>=30 else "#EA4335"
-                st.markdown(html_block(f"""
-                <div class="cov-row">
-                  <div style="font-weight:700;font-size:12px;">{row['state_label']}</div>
-                  <div style="display:flex;justify-content:space-between;font-size:10px;color:#666;margin:3px 0;">
-                    <span>✅{a} &nbsp;🔴{np2}</span>
-                    <span style="color:{bc};font-weight:700;">{p2}%</span>
-                  </div>
-                  <div class="cov-bar-bg">
-                    <div style="background:{bc};width:{p2}%;height:5px;border-radius:5px;"></div>
-                  </div>
-                </div>"""), unsafe_allow_html=True)
-
-    # ═══════════════════════════════════════════════════════════
     # TAB 3 — PRESENCE ANALYSIS
     # ═══════════════════════════════════════════════════════════
     with tab_pres:
@@ -1282,134 +1322,6 @@ def dashboard():
                                   "krm_display":"KRM","pop_fmt":"Population","status":"Status"})
                  .to_csv(index=False),
             file_name="no_presence.csv", mime="text/csv")
-
-    # ═══════════════════════════════════════════════════════════
-    # TAB — ANALYSIS  (deeper analytics: growth, correlation, benchmarking)
-    # ═══════════════════════════════════════════════════════════
-    with tab_analysis:
-        st.markdown('<div class="sec">📈 Performance Analysis</div>', unsafe_allow_html=True)
-
-        an_df = flt[flt["total_sale"].notna() & flt["avg_6m"].notna()].copy()
-        an_df = an_df[an_df["avg_6m"] > 0]
-
-        if an_df.empty:
-            st.info("No sufficient sales data in the current filter for analysis. Adjust slicers.")
-        else:
-            # Growth% = how this month's sale compares to the monthly-equivalent 6M average
-            an_df["growth_pct"] = ((an_df["month_sale"] - an_df["avg_6m"]/6) / (an_df["avg_6m"]/6) * 100).round(1)
-            an_df["sale_per_lakh_pop"] = an_df.apply(
-                lambda r: round(r["total_sale"]/(r["population"]/1e5), 2) if r["population"] > 0 else 0, axis=1)
-
-            a1, a2, a3, a4 = st.columns(4)
-            growers   = int((an_df["growth_pct"] > 0).sum())
-            decliners = int((an_df["growth_pct"] < 0).sum())
-            a1.metric("📈 Growing Districts", growers)
-            a2.metric("📉 Declining Districts", decliners)
-            a3.metric("Avg Growth %", f"{an_df['growth_pct'].mean():.1f}%")
-            a4.metric("Best Growth", f"{an_df['growth_pct'].max():.1f}%")
-
-            st.markdown("<br>", unsafe_allow_html=True)
-            g1, g2 = st.columns([1.3, 1])
-
-            with g1:
-                st.markdown('<div class="sec">🎯 Performance Quadrant — Avg Sale vs Growth%</div>', unsafe_allow_html=True)
-                st.caption("Bubble size = Population · Right = high growth · Up = strong base sale")
-                fig_quad = px.scatter(
-                    an_df, x="avg_6m", y="growth_pct", size="population",
-                    color="krm_display", color_discrete_map=KRM_COLORS,
-                    hover_name="district_title",
-                    hover_data={"state_label":True,"total_sale":":.1f","avg_6m":":.1f",
-                                "growth_pct":":.1f","population":False,"krm_display":False},
-                    labels={"avg_6m":"6-Month Avg (MT)","growth_pct":"Growth vs Avg (%)","krm_display":"KRM"},
-                    height=440,
-                )
-                med_x = an_df["avg_6m"].median()
-                fig_quad.add_hline(y=0, line_dash="dash", line_color="#888")
-                fig_quad.add_vline(x=med_x, line_dash="dash", line_color="#888")
-                fig_quad.update_layout(margin=dict(l=5,r=5,t=10,b=5),
-                                       legend=dict(orientation="h",y=-0.18,x=0))
-                st.plotly_chart(fig_quad, use_container_width=True)
-                st.caption("⭐ Top-right = Star performers  ·  ⚠️ Bottom-right = At-risk (high base, declining)  "
-                           "·  🌱 Top-left = Emerging (low base, growing)  ·  🔻 Bottom-left = Underperforming")
-
-            with g2:
-                st.markdown('<div class="sec">🏅 Sale Intensity — MT per Lakh Population</div>', unsafe_allow_html=True)
-                spp = an_df.nlargest(12, "sale_per_lakh_pop")[["district_title","sale_per_lakh_pop","state_label"]]
-                fig_spp = go.Figure(go.Bar(
-                    x=spp["sale_per_lakh_pop"], y=spp["district_title"], orientation="h",
-                    marker_color="#00BCD4",
-                    text=spp["sale_per_lakh_pop"].map(lambda v: f"{v:,.1f} MT"), textposition="outside",
-                    hovertemplate="<b>%{y}</b><br>%{x:.1f} MT / lakh pop<extra></extra>",
-                ))
-                fig_spp.update_layout(height=440, yaxis=dict(categoryorder="total ascending"),
-                                      margin=dict(l=5,r=60,t=10,b=5), showlegend=False)
-                st.plotly_chart(fig_spp, use_container_width=True)
-
-            st.markdown("<br>", unsafe_allow_html=True)
-            g3, g4 = st.columns(2)
-
-            with g3:
-                st.markdown('<div class="sec">🚀 Top 10 Gainers (Growth %)</div>', unsafe_allow_html=True)
-                gainers = an_df.nlargest(10, "growth_pct")[["district_title","state_label","krm_display","growth_pct","month_sale"]]
-                gainers = gainers.rename(columns={"district_title":"District","state_label":"State",
-                                                   "krm_display":"KRM","growth_pct":"Growth %","month_sale":f"{month_name} (MT)"})
-                st.dataframe(gainers.reset_index(drop=True), use_container_width=True, height=340)
-
-            with g4:
-                st.markdown('<div class="sec">🔻 Top 10 Decliners (Growth %)</div>', unsafe_allow_html=True)
-                decl = an_df.nsmallest(10, "growth_pct")[["district_title","state_label","krm_display","growth_pct","month_sale"]]
-                decl = decl.rename(columns={"district_title":"District","state_label":"State",
-                                             "krm_display":"KRM","growth_pct":"Growth %","month_sale":f"{month_name} (MT)"})
-                st.dataframe(decl.reset_index(drop=True), use_container_width=True, height=340)
-
-            # Pareto (80/20) analysis
-            st.markdown('<div class="sec">📐 Pareto Analysis — Sales Concentration</div>', unsafe_allow_html=True)
-            pareto = an_df.sort_values("total_sale", ascending=False).reset_index(drop=True)
-            pareto["cum_sale"] = pareto["total_sale"].cumsum()
-            pareto["cum_pct"]  = (pareto["cum_sale"] / pareto["total_sale"].sum() * 100).round(1)
-            pareto["rank_pct"] = ((pareto.index+1) / len(pareto) * 100).round(1)
-            n80 = int((pareto["cum_pct"] <= 80).sum()) + 1
-            pct_dist_80 = round(n80/len(pareto)*100, 1)
-            st.caption(f"**{n80} districts** ({pct_dist_80}% of all districts in filter) drive **80%** of total sales.")
-
-            fig_pareto = go.Figure()
-            fig_pareto.add_trace(go.Bar(
-                x=pareto["district_title"].head(25), y=pareto["total_sale"].head(25),
-                name="Total Sale", marker_color="#4285F4",
-            ))
-            fig_pareto.add_trace(go.Scatter(
-                x=pareto["district_title"].head(25), y=pareto["cum_pct"].head(25),
-                name="Cumulative %", yaxis="y2", mode="lines+markers", line=dict(color="#EA4335"),
-            ))
-            fig_pareto.update_layout(
-                height=380, xaxis_tickangle=-45,
-                yaxis=dict(title="Total Sale (MT)"),
-                yaxis2=dict(title="Cumulative %", overlaying="y", side="right", range=[0,105]),
-                legend=dict(orientation="h",x=0,y=1.1),
-                margin=dict(l=5,r=5,t=30,b=90),
-            )
-            st.plotly_chart(fig_pareto, use_container_width=True)
-
-            # State-level benchmark table
-            st.markdown('<div class="sec">🏛 State Benchmark</div>', unsafe_allow_html=True)
-            bench = an_df.groupby("state_label").agg(
-                Districts=("district","count"),
-                Total_Sale=("total_sale","sum"),
-                Avg_Growth=("growth_pct","mean"),
-                Sale_per_Lakh_Pop=("sale_per_lakh_pop","mean"),
-            ).reset_index().round(1).sort_values("Total_Sale", ascending=False)
-            bench = bench.rename(columns={"state_label":"State","Total_Sale":"Total (MT)",
-                                           "Avg_Growth":"Avg Growth %","Sale_per_Lakh_Pop":"MT/Lakh Pop"})
-            st.dataframe(bench.reset_index(drop=True), use_container_width=True, height=260)
-            st.download_button("⬇️ Download Analysis CSV",
-                               data=an_df[["state_label","district_title","krm_display","total_sale",
-                                           "avg_6m","month_sale","growth_pct","sale_per_lakh_pop"]]
-                                   .rename(columns={"state_label":"State","district_title":"District",
-                                                     "krm_display":"KRM","total_sale":"Total_MT","avg_6m":"6MAvg_MT",
-                                                     "month_sale":f"{month_name}_MT","growth_pct":"Growth%",
-                                                     "sale_per_lakh_pop":"MTperLakhPop"})
-                                   .to_csv(index=False),
-                               file_name="analysis.csv", mime="text/csv")
 
     # ═══════════════════════════════════════════════════════════
     # TAB 4 — PRODUCT SALES  (GG / IG)
@@ -1504,6 +1416,60 @@ def dashboard():
                                data=sale_tbl.to_csv(index=False),
                                file_name="district_sales.csv", mime="text/csv")
 
+            # ── AI Forecast (simple trend projection, only available with
+            #    uploaded invoice-level data — we need real dated rows to
+            #    build a month-by-month series) ──
+            st.markdown("---")
+            st.markdown('<div class="sec">🔮 AI Sales Forecast — Next Month (beta)</div>', unsafe_allow_html=True)
+            monthly_state = sales_source_info.get("monthly_state")
+            if not sales_source_info.get("using_invoice_data") or monthly_state is None or monthly_state.empty:
+                st.info(
+                    "Forecasting needs dated, invoice-level sales data with more than one "
+                    "month of history. Upload your sales file(s) in **📤 Sales Data (Admin)** "
+                    "to unlock this."
+                )
+            else:
+                st.caption(
+                    "A simple, transparent linear-trend projection per state (not a trained "
+                    "ML model) — fits a straight line through each state's monthly totals and "
+                    "extrapolates one month ahead. Treat it as an early-warning signal, not a "
+                    "guarantee."
+                )
+                fc = forecast_next_month(monthly_state)
+                fc_disp = fc.merge(
+                    pd.Series(STATE_LABELS).rename("label"),
+                    left_on="state", right_index=True, how="left"
+                )
+                fc_disp["label"] = fc_disp["label"].fillna(fc_disp["state"].str.title())
+
+                fcol1, fcol2 = st.columns([2,1])
+                with fcol1:
+                    top_fc = fc_disp.head(15).sort_values("forecast_next")
+                    fig_fc = go.Figure()
+                    fig_fc.add_trace(go.Bar(
+                        y=top_fc["label"], x=top_fc["last_actual"],
+                        orientation="h", name="Last Actual Month", marker_color="#90CAF9",
+                    ))
+                    fig_fc.add_trace(go.Bar(
+                        y=top_fc["label"], x=top_fc["forecast_next"],
+                        orientation="h", name="Forecast — Next Month", marker_color="#FF6D00",
+                    ))
+                    fig_fc.update_layout(
+                        barmode="group", height=420,
+                        legend=dict(orientation="h", x=0, y=1.08, title=""),
+                        margin=dict(l=5, r=20, t=40, b=5),
+                    )
+                    st.plotly_chart(fig_fc, use_container_width=True)
+                with fcol2:
+                    risers = fc_disp.nlargest(5, "trend_pct")[["label","trend_pct"]]
+                    fallers = fc_disp.nsmallest(5, "trend_pct")[["label","trend_pct"]]
+                    st.markdown("**📈 Trending Up**")
+                    for _, r in risers.iterrows():
+                        st.markdown(f"- {r['label']}: <span style='color:#34A853;font-weight:700;'>+{r['trend_pct']}%</span>", unsafe_allow_html=True)
+                    st.markdown("**📉 Trending Down**")
+                    for _, r in fallers.iterrows():
+                        st.markdown(f"- {r['label']}: <span style='color:#EA4335;font-weight:700;'>{r['trend_pct']}%</span>", unsafe_allow_html=True)
+
     # ═══════════════════════════════════════════════════════════
     # TAB 5 — TEAM VIEW
     # ═══════════════════════════════════════════════════════════
@@ -1546,7 +1512,69 @@ def dashboard():
     # TAB 6 — DATA TABLE
     # ═══════════════════════════════════════════════════════════
     with tab_table:
-        st.markdown('<div class="sec">📋 Full District Data</div>', unsafe_allow_html=True)
+        st.markdown('<div class="sec">📋 Full District Data — Sales Backend Team</div>', unsafe_allow_html=True)
+
+        # ── Admin: upload custom data / define extra columns ──
+        extra_cols = []
+        if is_admin:
+            with st.expander("🛠️ Admin: Upload Custom Data / Add Columns", expanded=False):
+                st.caption(
+                    "Upload an Excel or CSV file with a **dist_code** column (matching the "
+                    "census 'District code') plus any extra columns you want to track (e.g. "
+                    "remarks, targets, contact numbers). They get merged into this table by "
+                    "district automatically."
+                )
+                cc_file = st.file_uploader("Custom columns file", type=["xlsx","xls","csv"], key="custom_cols_uploader")
+                if cc_file is not None:
+                    try:
+                        cc_df = pd.read_csv(cc_file) if cc_file.name.lower().endswith(".csv") else pd.read_excel(cc_file)
+                        cc_df.columns = [str(c).strip() for c in cc_df.columns]
+                        if "dist_code" not in cc_df.columns:
+                            st.error("File must contain a 'dist_code' column matching the census District code.")
+                        else:
+                            cc_df.to_csv(FILES["custom"], index=False)
+                            st.cache_data.clear()
+                            st.success(f"Saved {len(cc_df)} rows with columns: "
+                                       f"{', '.join([c for c in cc_df.columns if c != 'dist_code'])}")
+                            st.rerun()
+                    except Exception as e:
+                        st.error(f"Couldn't read file: {e}")
+
+                try:
+                    existing_cc = pd.read_csv(FILES["custom"])
+                    extra_cols = [c for c in existing_cc.columns if c != "dist_code"]
+                except Exception:
+                    extra_cols = []
+
+                if extra_cols:
+                    st.markdown("##### Column Types (for display formatting)")
+                    meta = {}
+                    if os.path.exists(FILES["meta"]):
+                        try:
+                            with open(FILES["meta"]) as f: meta = json.load(f)
+                        except Exception: meta = {}
+                    new_meta = {}
+                    mcols = st.columns(min(len(extra_cols), 4) or 1)
+                    for i, c in enumerate(extra_cols):
+                        with mcols[i % len(mcols)]:
+                            new_meta[c] = st.selectbox(
+                                c, ["text","number"],
+                                index=0 if meta.get(c,"text")=="text" else 1,
+                                key=f"ccmeta_{c}",
+                            )
+                    if st.button("💾 Save Column Types"):
+                        with open(FILES["meta"], "w") as f:
+                            json.dump(new_meta, f, indent=2)
+                        st.success("Saved.")
+                else:
+                    st.caption("No custom columns yet — upload a file above.")
+        else:
+            extra_cols = [c for c in flt.columns if c not in [
+                "dist_code","state","district","population","krm","kro","jn_kro","responsible",
+                "total_sale","avg_6m","month_sale","gg_total","gg_avg","ig_total","ig_avg",
+                "status","state_label","district_title","pop_fmt","pop_lakh","lat","lon","krm_display",
+            ]]
+
         srch2 = st.text_input("🔍 Search…", key="tbl_srch2")
         tbl   = flt.copy()
         if srch2:
@@ -1554,15 +1582,34 @@ def dashboard():
                       tbl["state_label"].str.contains(srch2,case=False,na=False)|
                       tbl["krm_display"].str.contains(srch2,case=False,na=False)]
 
-        disp = tbl[[
-            "state_label","district_title","krm_display","kro","jn_kro","responsible",
-            "population","total_sale","avg_6m","month_sale","gg_total","ig_total","status"
-        ]].rename(columns={
+        base_cols = ["state_label","district_title","krm_display","kro","jn_kro","responsible",
+                     "population","total_sale","avg_6m","month_sale","gg_total","ig_total","status"]
+        rename_map = {
             "state_label":"State","district_title":"District","krm_display":"KRM",
             "kro":"KRO","jn_kro":"JR.KRO","responsible":"Responsible",
             "population":"Population","total_sale":"Total (MT)","avg_6m":"6M Avg (MT)",
             "month_sale":f"{month_name} (MT)","gg_total":"GG (MT)","ig_total":"IG (MT)","status":"Status"
-        }).sort_values("Total (MT)",ascending=False).reset_index(drop=True)
+        }
+        # Guard against a custom column name colliding with a reserved built-in
+        # column/display-label (e.g. a custom column literally called "KRO",
+        # which would otherwise duplicate the built-in KRO column and break
+        # Styler downstream, since pandas requires unique column names to style).
+        reserved = {c.lower() for c in base_cols} | {v.lower() for v in rename_map.values()}
+        safe_extra_cols = [c for c in extra_cols if c in tbl.columns and c.lower() not in reserved]
+        skipped_extra_cols = [c for c in extra_cols if c in tbl.columns and c.lower() in reserved]
+
+        show_cols = base_cols + safe_extra_cols
+        disp = tbl[show_cols].rename(columns=rename_map)
+        # Final safety net: never let a duplicate column name reach Styler.
+        disp = disp.loc[:, ~disp.columns.duplicated()]
+        disp = disp.sort_values("Total (MT)",ascending=False).reset_index(drop=True)
+
+        if skipped_extra_cols:
+            st.caption(
+                f"⚠️ Custom column(s) {', '.join(skipped_extra_cols)} share a name with a "
+                "built-in column and were hidden here to avoid a display conflict — rename "
+                "them in your upload to show both."
+            )
 
         def status_style(val):
             if val=="ACTIVE":      return "background:#e6f4ea;color:#137333;font-weight:700"
@@ -1818,12 +1865,13 @@ def dashboard():
             st.markdown('<div class="sec">📤 Sales Data Source</div>', unsafe_allow_html=True)
             st.caption(
                 "By default, sales figures (Total Sale, current-month Sale, 6-Month Avg, "
-                "GG/IG) come from the pre-built columns in the census workbook. Upload a raw "
-                "invoice / order-level export here instead, and every tab in this dashboard — "
-                "Live Dashboard, Analysis, Product Sales, Team View, Data Table — will compute "
-                "those same figures live from it. Population, KRM/KRO/JR.KRO ownership, and "
-                "district identity keep coming from the census file and are auto-matched in by "
-                "district, so you don't need to duplicate that data in your sales export."
+                "GG/IG) come from the pre-built columns in the census workbook. Upload raw "
+                "invoice / order-level exports here instead — you can upload several files at "
+                "once (e.g. one per region or per week) and they'll be combined automatically — "
+                "and every module (top Presence Map, Live Dashboard, Product Sales, Team View, "
+                "Data Table) will compute those figures live from it. Population, KRM/KRO/JR.KRO "
+                "ownership, and district identity keep coming from the census file and are "
+                "auto-matched in by district, so you don't need to duplicate that data here."
             )
 
             if sales_source_info["using_invoice_data"]:
@@ -1844,27 +1892,39 @@ def dashboard():
                 )
 
             st.markdown("---")
-            st.markdown("#### ⬆️ Upload / Replace Sales Data")
+            st.markdown("#### ⬆️ Upload Sales Data (single or multiple files)")
             st.caption(
                 "Accepted formats: `.xlsx` or `.csv`. Required columns (any order, case-"
                 "insensitive) — **STATE**, **DISTRICT/ST**, **QTY**, and **DESPATCH DATE** "
                 "(or ORDER DATE). Optional but recommended: **PRODUCT** (used to split GG vs "
                 "IG — matched by the text 'GG' / 'IG' appearing in the product name), "
-                "**INVOICE NO**, **ORDER NO**, **BILLING NAME**, **CLIENT NAME**."
+                "**INVOICE NO**, **ORDER NO**, **BILLING NAME**, **CLIENT NAME**. "
+                "Uploading a new batch replaces the previous one."
             )
-            up = st.file_uploader("Sales data file", type=["xlsx", "xls", "csv"], key="sales_data_uploader")
-            if up is not None:
-                dest = SALES_SOURCE_FILE if up.name.lower().endswith((".xlsx",".xls")) \
-                       else SALES_SOURCE_FILE.replace(".xlsx",".csv")
-                with open(dest, "wb") as f:
-                    f.write(up.getbuffer())
-                # Only one sales source file should exist at a time
-                other = SALES_SOURCE_FILE.replace(".xlsx",".csv") if dest == SALES_SOURCE_FILE else SALES_SOURCE_FILE
-                if os.path.exists(other):
-                    os.remove(other)
-                st.cache_data.clear()
-                st.success(f"Uploaded **{up.name}** — processing…")
-                st.rerun()
+            ups = st.file_uploader(
+                "Sales data file(s)", type=["xlsx", "xls", "csv"],
+                accept_multiple_files=True, key="sales_data_uploader",
+            )
+            if ups:
+                with st.spinner(f"Combining {len(ups)} file(s)…"):
+                    frames = []
+                    read_errors = []
+                    for f in ups:
+                        try:
+                            frames.append(pd.read_csv(f) if f.name.lower().endswith(".csv") else pd.read_excel(f))
+                        except Exception as e:
+                            read_errors.append(f"{f.name}: {e}")
+                    if read_errors:
+                        st.error("Couldn't read: " + "; ".join(read_errors))
+                    if frames:
+                        combined = pd.concat(frames, ignore_index=True, sort=False)
+                        combined.to_excel(SALES_SOURCE_FILE, index=False)
+                        csv_twin = SALES_SOURCE_FILE.replace(".xlsx", ".csv")
+                        if os.path.exists(csv_twin):
+                            os.remove(csv_twin)
+                        st.cache_data.clear()
+                        st.success(f"Combined {len(frames)} file(s), {len(combined):,} total rows — processing…")
+                        st.rerun()
 
             st.markdown("---")
             st.markdown("#### 📐 How the figures are computed")
