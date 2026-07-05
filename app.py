@@ -110,7 +110,7 @@ def login_page():
                     st.rerun()
                 else:
                     st.error("❌ Wrong credentials")
-        st.caption("DEVELOPED BY SUDIPTA CHATTERJEE")
+        st.caption("Demo:  sudipta / sudipta@2026")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # CONSTANTS
@@ -1522,9 +1522,10 @@ def dashboard():
                     "Upload an Excel or CSV file with a **dist_code** column (matching the "
                     "census 'District code') plus any extra columns you want to track (e.g. "
                     "remarks, targets, contact numbers). They get merged into this table by "
-                    "district automatically."
+                    "district automatically. **Uploading a new file replaces the previous one "
+                    "entirely** — re-upload any time to refresh the data."
                 )
-                cc_file = st.file_uploader("Custom columns file", type=["xlsx","xls","csv"], key="custom_cols_uploader")
+                cc_file = st.file_uploader("Custom columns file (upload / re-upload)", type=["xlsx","xls","csv"], key="custom_cols_uploader")
                 if cc_file is not None:
                     try:
                         cc_df = pd.read_csv(cc_file) if cc_file.name.lower().endswith(".csv") else pd.read_excel(cc_file)
@@ -1544,9 +1545,11 @@ def dashboard():
                     existing_cc = pd.read_csv(FILES["custom"])
                     extra_cols = [c for c in existing_cc.columns if c != "dist_code"]
                 except Exception:
+                    existing_cc = None
                     extra_cols = []
 
                 if extra_cols:
+                    st.markdown("---")
                     st.markdown("##### Column Types (for display formatting)")
                     meta = {}
                     if os.path.exists(FILES["meta"]):
@@ -1566,6 +1569,34 @@ def dashboard():
                         with open(FILES["meta"], "w") as f:
                             json.dump(new_meta, f, indent=2)
                         st.success("Saved.")
+
+                    st.markdown("---")
+                    st.markdown("##### 🗑️ Delete a Column")
+                    dcol1, dcol2 = st.columns([3,1])
+                    with dcol1:
+                        col_to_delete = st.selectbox("Column to remove", extra_cols, key="del_custom_col_pick")
+                    with dcol2:
+                        st.markdown("<br>", unsafe_allow_html=True)
+                        if st.button("🗑️ Delete Column", key="del_custom_col_btn"):
+                            existing_cc.drop(columns=[col_to_delete]).to_csv(FILES["custom"], index=False)
+                            meta.pop(col_to_delete, None)
+                            with open(FILES["meta"], "w") as f:
+                                json.dump(meta, f, indent=2)
+                            st.cache_data.clear()
+                            st.success(f"Deleted column '{col_to_delete}'.")
+                            st.rerun()
+
+                    st.markdown("---")
+                    st.markdown("##### ⚠️ Delete All Custom Data")
+                    st.caption("Removes every custom column and all uploaded custom data — cannot be undone.")
+                    if st.button("🗑️ Delete Full Custom Data", key="del_all_custom_data"):
+                        if os.path.exists(FILES["custom"]):
+                            os.remove(FILES["custom"])
+                        if os.path.exists(FILES["meta"]):
+                            os.remove(FILES["meta"])
+                        st.cache_data.clear()
+                        st.success("All custom data deleted.")
+                        st.rerun()
                 else:
                     st.caption("No custom columns yet — upload a file above.")
         else:
